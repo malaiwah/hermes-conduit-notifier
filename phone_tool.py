@@ -71,9 +71,10 @@ CALENDAR_SCHEMA: dict[str, Any] = {
         "people can read, and don't write attendee emails into memory unless the user asks. "
         "Reads: overview (what's shared, calendars, freshness), calendars, events, free_busy, next, reminders. "
         "Writes queue a change the phone applies: add_event, update_event, delete_event, add_reminder, "
-        "update_reminder, complete_reminder, delete_reminder; the user approves each on the phone unless they let Hermes add "
-        "without asking (updates and deletes always ask), so never say a change is done until pending shows it "
-        "applied. pending: recent changes and how they went. Read results are as of the phone's last sync. "
+        "update_reminder, complete_reminder, delete_reminder; the user approves each on the phone, by tap or by saying "
+        "yes or no in a voice chat as their very next words after the reply that queued it, unless they let Hermes add "
+        "without asking (updates, deletes and completions always ask), so "
+        "never say a change is done until pending shows it applied. pending: recent changes and how they went. Read results are as of the phone's last sync. "
         f"Before setting up a scheduled job or standing rule around the calendar, load "
         f"skill_view(\"conduit_push:{SKILL_NAME}\"). {CALENDAR_FIRST}"
     ),
@@ -111,7 +112,7 @@ CALENDAR_SCHEMA: dict[str, Any] = {
             "all_day": {"type": "boolean"},
             "location": {"type": "string"},
             "notes": {"type": "string"},
-            "url": {"type": "string"},
+            "url": {"type": "string", "description": "An http or https link."},
             "alarms_min": {"type": "array", "maxItems": 3, "items": {"type": "integer", "minimum": 0,
                                                                       "maximum": 10080},
                            "description": "Event alerts, minutes before the start."},
@@ -146,8 +147,9 @@ PHONE_SCHEMA: dict[str, Any] = {
         "don't volunteer it in a chat other people can read. "
         "Alarms and timers ring on the phone through Silent and Focus, when the user lets Hermes set them: "
         "alarms lists the ones you set that are still on; set_alarm, set_timer and cancel_alarm queue a change "
-        "the phone applies (the user approves it there unless they let Hermes add without asking), so never say "
-        "it's set until pending shows it applied. Set them when the user asks (\"wake me at 6:30\", \"timer for "
+        "the phone applies (the user approves it there, by tap or by saying yes or no in a voice chat as their very next "
+        "words after the reply that queued it, unless they let "
+        "Hermes add without asking), so never say it's set until pending shows it applied. Set them when the user asks (\"wake me at 6:30\", \"timer for "
         "the pasta\") or for something they set up, never on your own initiative. pending: recent changes and how "
         f"they went. {PHONE_FIRST}"
     ),
@@ -453,7 +455,13 @@ def _queued(store: PhoneStore, change: dict[str, Any], profile: str) -> tuple[st
                           "tells them and offers Undo. It isn't on the phone yet: don't say it's done until pending "
                           "shows applied."), earlier
     return "waiting_for_approval", ("Sent to the phone; waiting for the user to approve it there (they can also edit "
-                                    "or dismiss it). Don't say it's done until pending shows applied."), earlier
+                                    "or dismiss it). In a voice chat they can just say yes or no and Conduit answers the "
+                                    "card for them, so ask in this reply and don't ask them to tap first. Conduit takes "
+                                    "that yes or no only as the user's very next words after this reply. Only if "
+                                    "they say something else first, or pending still shows it waiting after they said "
+                                    "it, ask them to tap the card instead. "
+                                    "When they answer, check pending before "
+                                    "saying how it went; don't say it's done until pending shows applied."), earlier
 
 
 def _write(store: PhoneStore, kind: str, args: dict[str, Any], session_id: Any, profile: str) -> dict[str, Any]:
@@ -466,7 +474,7 @@ def _write(store: PhoneStore, kind: str, args: dict[str, Any], session_id: Any, 
             fields[key] = args[key]
     if not is_event and args.get("due") is not None and args.get("due_all_day") is not None:
         fields["due_all_day"] = args["due_all_day"]
-    with store.reader(need, args.get("device")) as opened:
+    with store.reader(need, args.get("device"), for_change=True) as opened:
         if opened is None:
             raise PhoneError("nothing_shared", "No device shares " + (
                 "its calendar" if is_event else "reminders") + " with Hermes.")
@@ -562,7 +570,8 @@ def _pending(store: PhoneStore) -> dict[str, Any]:
     return {"ok": True, "changes": changes,
             "note": "waiting: the phone hasn't answered yet (seen_by_phone says whether it has it). applied / "
                     "edited (the user changed it first; see note) / dismissed / failed (see note) / expired "
-                    "(a week without an answer)." if changes else "No changes asked for recently."}
+                    "(a week without an answer) / lost (the phone was set up again before it got it: tell the "
+                    "user and offer to ask again)." if changes else "No changes asked for recently."}
 
 
 def _alarms(store: PhoneStore, args: dict[str, Any], exact: bool) -> dict[str, Any]:
@@ -589,7 +598,7 @@ def _alarm_write(store: PhoneStore, kind: str, args: dict[str, Any], session_id:
     if stray:
         return {"ok": False, "error": "invalid", "note": f"{kind} doesn't take {', '.join(stray)}."}
     target = {"alarm_id": args.get("alarm_id")} if kind == "cancel_alarm" else None
-    with store.reader("alarms", args.get("device")) as opened:
+    with store.reader("alarms", args.get("device"), for_change=True) as opened:
         if opened is None:
             raise PhoneError("nothing_shared", "No device lets Hermes set alarms and timers.")
         _, device = opened

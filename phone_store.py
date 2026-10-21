@@ -51,6 +51,7 @@ import base64
 import contextlib
 import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -62,8 +63,20 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
+try:
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None  # type: ignore[assignment]
+try:
+    import msvcrt
+except ImportError:  # everything but Windows
+    msvcrt = None  # type: ignore[assignment]
+from urllib.parse import urlsplit
+
+logger = logging.getLogger(__name__)
+
 FILE_NAME = "conduit-phone.sqlite3"
-SCHEMA_VERSION = 2  # 2: alarms and contacts (plugin 0.30.0)
+SCHEMA_VERSION = 3  # 2: alarms and contacts (plugin 0.30.0); 3: last_contact, prior_sharing (0.51.9)
 
 SALT = b"conduit-phone-v1"
 INFO_INGEST = b"conduit-phone-v1 ingest device-to-host"
@@ -98,6 +111,19 @@ _DISPLAY_ONLY_KINDS = ("delete_event", "complete_reminder", "delete_reminder")
 ALARM_CHANGE_KINDS = ("set_alarm", "set_timer", "cancel_alarm")
 CHANGE_KINDS = CALENDAR_CHANGE_KINDS + ALARM_CHANGE_KINDS
 OUTCOMES = ("applied", "edited", "dismissed", "failed", "expired")
+# Set by the host, never by the phone: the phone was set up again (a new key)
+# before it fetched the change, so it will never see it.
+LOST_NOTE = ("The phone was set up again before it got this change, so it never saw it. Tell the user, and "
+             "offer to ask again.")
+LOST_DELIVERED_NOTE = ("The phone was set up again after it got this change, before it answered. Ask the user "
+                       "whether it's on their phone before asking again, so it isn't added twice.")
+# How long a device that checked in but hasn't uploaded since a new key
+# holds its place as the device in use, instead of another one standing in.
+SETTING_UP_S = 10 * 60
+# When a device was last in touch: its last check-in (status) or upload. The
+# device in use comes first; a tie in the same second goes to the older row.
+_IN_TOUCH = "MAX(COALESCE(last_contact, 0), COALESCE(last_seen, 0))"
+_IN_TOUCH_ORDER = f"{_IN_TOUCH} DESC, rowid"
 EVENT_FIELDS = ("title", "start", "end", "all_day", "calendar_id", "location", "notes", "url", "alarms_min")
 REMINDER_FIELDS = ("title", "list_id", "due", "due_all_day", "priority", "notes", "url", "location_alarm")
 ALARM_FIELDS = ("label", "at", "time", "repeats")
@@ -143,6 +169,8 @@ MAX_VALUE_LABEL_CHARS = 30
 # Finished changes stay this long so the agent can see how they went.
 FINISHED_KEPT_S = 30 * 24 * 3600
 MAX_WINDOW_DAYS = 400
+# How far ahead of this host's clock a batch's sent_at may be.
+MAX_CLOCK_SKEW_S = 5 * 60
 EARLIEST = datetime(2000, 1, 1, tzinfo=timezone.utc)
 LATEST = datetime(2100, 1, 1, tzinfo=timezone.utc)
 
@@ -167,6 +195,34 @@ _COLOR = re.compile(r"^#[0-9A-Fa-f]{6}([0-9A-Fa-f]{2})?\Z")
 _CONTROL = re.compile("[\x00-\x1f\x7f-\x9f\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]+")
 
 _thread_lock = threading.Lock()
+
+
+@contextlib.contextmanager
+def _exclusive(handle: Any) -> Iterator[None]:
+    # The same locking as calls_store: flock where there is one, a
+    # first-byte lock on Windows.
+    if fcntl is not None:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    elif msvcrt is not None:
+        handle.seek(0)
+        for attempt in range(6):  # about a minute
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                break
+            except OSError:
+                if attempt == 5:
+                    raise
+        try:
+            yield
+        finally:
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        yield
 
 
 class PhoneError(ValueError):
@@ -395,6 +451,21 @@ def _url(value: Any, field: str) -> str | None:
     return text
 
 
+def _write_url(value: Any, field: str) -> str | None:
+    """A change's link: Conduit keeps only an http or https one and applies
+    the rest of the change without anything else, so it's refused here."""
+    text = _url(value, field)
+    if text is None:
+        return None
+    try:
+        parts = urlsplit(text)
+    except ValueError:
+        parts = None
+    if parts is None or parts.scheme.lower() not in ("http", "https") or not parts.netloc:
+        raise PhoneError("malformed", f"{field} must be an http or https URL")
+    return text
+
+
 def _stored_list(value: Any) -> list[Any] | None:
     """A stored JSON list, or None when it's missing or corrupt."""
     decoded = _decode(value, None)
@@ -424,9 +495,23 @@ class PhoneStore:
         return self.path.exists()
 
     @contextlib.contextmanager
+    def _locked(self) -> Iterator[None]:
+        """The writers' lock: a lock file beside the database, which every
+        process (two dashboards, the agent) and thread takes through its own
+        handle, then this process's thread lock. The file lock comes first,
+        so waiting on another process never holds up other profiles' stores
+        here. The lock file outlives a wipe, so a writer waiting on it never
+        races the unlink."""
+        lock_path = self.path.with_name(f".{self.path.name}.lock")
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        flags = os.O_RDWR | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+        with os.fdopen(os.open(lock_path, flags, 0o600), "a+b") as handle, _exclusive(handle), _thread_lock:
+            yield
+
+    @contextlib.contextmanager
     def _write(self) -> Iterator[sqlite3.Connection]:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        with _thread_lock:
+        with self._locked():
             if not self.path.exists():
                 # Owner-only from the first byte; SQLite gives the -wal and
                 # -shm files the same mode.
@@ -447,45 +532,49 @@ class PhoneStore:
             finally:
                 connection.close()
 
-    def _older_schema(self) -> bool:
-        """True when the file was written by an older plugin, so a read
-        upgrades it first instead of reading as nothing."""
+    def _open_read(self) -> tuple[sqlite3.Connection, str | None] | None:
+        """A read-only connection and the schema it holds (None when it can't
+        be read), or None when there's no file (gone since a wipe)."""
+        if not self.path.exists():
+            return None
         try:
             connection = sqlite3.connect(f"{self.path.as_uri()}?mode=ro", uri=True, timeout=15)
         except sqlite3.DatabaseError:
-            return False
+            return None
         try:
+            connection.execute("PRAGMA query_only=ON")
             version = _meta(connection, "schema")
         except sqlite3.DatabaseError:
-            return False
-        finally:
-            connection.close()
-        return version is not None and version.isdigit() and int(version) < SCHEMA_VERSION
+            version = None
+        return connection, version
 
     @contextlib.contextmanager
     def _read(self) -> Iterator[sqlite3.Connection | None]:
-        if not self.path.exists():
+        opened = self._open_read()
+        if opened is None:
             yield None
             return
-        if self._older_schema():
-            with contextlib.suppress(PhoneError, sqlite3.DatabaseError, OSError):
-                with self._write():
-                    pass
+        connection, version = opened
         try:
-            connection = sqlite3.connect(f"{self.path.as_uri()}?mode=ro", uri=True, timeout=15)
-        except sqlite3.DatabaseError:
-            # Deleted since the check above (a wipe).
-            yield None
-            return
-        try:
+            if version is not None and version.isdigit() and int(version) < SCHEMA_VERSION:
+                # An older plugin's file: upgrade it first. One that can't be
+                # upgraded now (another process holds it, a disk error) still
+                # has its data, so it isn't read as nothing.
+                connection.close()
+                try:
+                    with self._write():
+                        pass
+                except (PhoneError, sqlite3.DatabaseError, OSError) as error:
+                    raise PhoneError("upgrade_pending", "The calendar store is being upgraded; try again in a moment",
+                                     status=503) from error
+                opened = self._open_read()
+                if opened is None:
+                    yield None
+                    return
+                connection, version = opened
             # Only opening counts as "unreadable"; an error in the caller's
             # own query goes up as it is.
-            try:
-                connection.execute("PRAGMA query_only=ON")
-                readable = _meta(connection, "schema") == str(SCHEMA_VERSION)
-            except sqlite3.DatabaseError:
-                readable = False
-            yield connection if readable else None
+            yield connection if version == str(SCHEMA_VERSION) else None
         finally:
             connection.close()
 
@@ -494,9 +583,9 @@ class PhoneStore:
     def register_key(self, body: Any) -> dict[str, Any]:
         """A device's X25519 public key in, this profile's for that device
         out. A new device key for a known device drops that device's data and
-        its pending changes (a reinstall, or sharing turned off and on: the
-        phone sends everything again); the same device key again keeps them
-        and only refreshes the host key."""
+        marks its pending changes lost, so the agent hears it (a reinstall,
+        or sharing turned off and on: the phone sends everything again); the
+        same device key again keeps them and only refreshes the host key."""
         if not isinstance(body, dict):
             raise PhoneError("malformed", "Expected a JSON object")
         device_id = body.get("device_id")
@@ -521,7 +610,12 @@ class PhoneStore:
                                  "from Conduit first", status=409)
             fresh = not known or bytes(known[0]) != device_public
             if known and fresh:
-                _drop_device_data(db, device_id)
+                # The phone will never see what was waiting for its old key:
+                # say so to the agent instead of dropping it unseen.
+                db.execute("UPDATE changes SET state='lost', finished_at=?, reported_at=NULL,"
+                           " note=CASE WHEN delivered_at IS NULL THEN ? ELSE ? END WHERE device=? AND state='pending'",
+                           (now, LOST_NOTE, LOST_DELIVERED_NOTE, device_id))
+                _drop_device_data(db, device_id, keep_changes=True)
             db.execute(
                 "INSERT INTO devices(id, name, device_public, host_private, host_public, kid, created_at)"
                 " VALUES(?,?,?,?,?,?,?)"
@@ -531,10 +625,26 @@ class PhoneStore:
                 (device_id, name, device_public, host_private, host_public, kid, now),
             )
             if known and fresh:
-                db.execute("UPDATE devices SET last_seen=NULL, last_sent=NULL, sharing=NULL, tz=NULL,"
-                           " window_from=NULL, window_to=NULL WHERE id=?", (device_id,))
+                # What it shared before stays, so while it sets up it holds its
+                # place only for what it shared (``_pick_device``).
+                db.execute("UPDATE devices SET prior_sharing=COALESCE(sharing, prior_sharing), last_seen=NULL,"
+                           " last_sent=NULL, sharing=NULL, tz=NULL, window_from=NULL, window_to=NULL WHERE id=?",
+                           (device_id,))
             generation = _meta(db, "generation")
         return {"kid": kid, "host_public_key": b64u(host_public), "generation": generation}
+
+    def _still_keyed(self, device_id: str, kid: str) -> None:
+        """Refuses once the device has registered again since ``kid`` was
+        checked. A sealed answer's read runs in its own connection after the
+        request is opened, so a re-registration (and the new key's upload) can
+        land in between; checking again after the read means an answer is
+        sealed to ``kid`` only if no newer key's data could have been read.
+        Every registration mints a new host key, so a kid never comes back."""
+        with self._read() as db:
+            row = None if db is None else db.execute("SELECT kid FROM devices WHERE id=?", (device_id,)).fetchone()
+        if row is None or row[0] != kid:
+            raise PhoneError("unknown_key", "This device's calendar key isn't on this profile; set it up again",
+                             status=409)
 
     def _device_key(self, db: sqlite3.Connection, device_id: str, kid: str, purpose: bytes = INFO_INGEST) -> bytes:
         row = db.execute("SELECT device_public, host_private, host_public, kid FROM devices WHERE id=?",
@@ -570,11 +680,33 @@ class PhoneStore:
                 raise PhoneError("malformed", "The sealed batch isn't JSON") from None
             if not isinstance(batch, dict) or batch.get("batch_id") != batch_id:
                 raise PhoneError("malformed", "The sealed batch doesn't match its envelope")
-            result = _apply(db, device_id, batch, now)
-            _expire(db, now)
-            result["pending"] = db.execute("SELECT COUNT(*) FROM changes WHERE device=? AND state='pending'",
-                                           (device_id,)).fetchone()[0]
-            generation = _meta(db, "generation")
+            try:
+                result = _apply(db, device_id, batch, now)
+            except PhoneError as error:
+                if error.code != "clock_skew":
+                    raise
+                # Refused, but what it turns off still goes (committed below):
+                # a phone whose clock runs fast can always take sharing back.
+                skewed = error
+                try:
+                    sharing = _parse_sharing(batch.get("sharing"))
+                except PhoneError:
+                    sharing = None
+                if sharing is not None:
+                    stored = db.execute("SELECT sharing FROM devices WHERE id=?", (device_id,)).fetchone()
+                    sharing = _narrowed(_decode(stored[0], None) if stored else None, sharing)
+                    _forget_unshared(db, device_id, sharing)
+                    db.execute("UPDATE devices SET sharing=? WHERE id=?", (json.dumps(sharing), device_id))
+                db.execute("UPDATE devices SET last_seen=? WHERE id=?", (now, device_id))
+                _expire(db, now)
+            else:
+                skewed = None
+                _expire(db, now)
+                result["pending"] = db.execute("SELECT COUNT(*) FROM changes WHERE device=? AND state='pending'",
+                                               (device_id,)).fetchone()[0]
+                generation = _meta(db, "generation")
+        if skewed is not None:
+            raise skewed
         return {**result, "generation": generation}
 
     # Exchange --------------------------------------------------------------------
@@ -617,6 +749,7 @@ class PhoneStore:
             raise PhoneError("malformed", "The sealed request doesn't match its envelope")
 
         def seal_answer(fields: dict[str, Any]) -> dict[str, str]:
+            self._still_keyed(device_id, kid)
             body = json.dumps({"call_id": call_id, **fields}, ensure_ascii=False, separators=(",", ":"))
             nonce, ct = seal(answer_key, body.encode("utf-8"), exchange_aad("answer", op, kid, device_id, call_id))
             return {"nonce": nonce, "ct": ct}
@@ -626,7 +759,7 @@ class PhoneStore:
     def exchange(self, envelope: Any) -> dict[str, Any]:
         """The ``/phone/exchange`` route: open, run the operation, seal."""
         device_id, _, request, seal_answer = self.open_exchange(envelope, ops=("changes",))
-        changes = self.exchange_changes(device_id, request.get("results"))
+        changes = self.exchange_changes(device_id, request.get("results"), kid=envelope["kid"])
         return {"v": 1, **seal_answer({"changes": changes})}
 
     def open_voice_request(self, envelope: Any) -> tuple[str, dict[str, Any], Callable[[dict[str, Any]], dict[str, str]]]:
@@ -639,14 +772,18 @@ class PhoneStore:
         device_id, _, request, seal_answer = self.open_exchange(envelope, ops=("voice",))
         return device_id, request, seal_answer
 
-    def exchange_changes(self, device_id: str, results: Any) -> list[dict[str, Any]]:
+    def exchange_changes(self, device_id: str, results: Any, *, kid: str) -> list[dict[str, Any]]:
         """Records the phone's outcomes for its changes, then answers every
         change still pending for that device, oldest first (at most
-        MAX_CHANGES_PER_ANSWER). Changes older than a week expire first."""
+        MAX_CHANGES_PER_ANSWER). Changes older than a week expire first.
+        ``kid``: the key the request was opened with, checked again in this
+        transaction, so a request that outlived a re-registration records and
+        reads nothing."""
         parsed = _parse_results(results)
         now = int(self.clock())
         with self._write() as db:
-            if db.execute("SELECT 1 FROM devices WHERE id=?", (device_id,)).fetchone() is None:
+            row = db.execute("SELECT kid FROM devices WHERE id=?", (device_id,)).fetchone()
+            if row is None or row[0] != kid:
                 raise PhoneError("unknown_key", "This device's calendar key isn't on this profile; set it up again",
                                  status=409)
             _expire(db, now)
@@ -654,7 +791,7 @@ class PhoneStore:
                 # Only this device's own changes, and only while they wait:
                 # a repeated result (the phone retrying) changes nothing.
                 db.execute("UPDATE changes SET state=?, finished_at=?, item_id=?, note=?, reported_at=NULL"
-                           " WHERE id=? AND device=? AND state='pending'",
+                           " WHERE id=? AND device=? AND state IN ('pending', 'lost')",
                            (result["outcome"], now, result.get("item_id"), result.get("note"), result["id"],
                             device_id))
             rows = db.execute(f"SELECT {_CHANGE_COLUMNS} FROM changes WHERE device=? AND state='pending'"
@@ -687,7 +824,7 @@ class PhoneStore:
         now = int(self.clock())
         with self._write() as db:
             _expire(db, now)
-            device_id, device_name, sharing = _pick_device(db, device, need)
+            device_id, device_name, sharing = _pick_device(db, device, need, now=now)
             if db.execute("SELECT COUNT(*) FROM changes WHERE state='pending'").fetchone()[0] >= MAX_PENDING:
                 raise PhoneError("too_many_pending",
                                  f"{MAX_PENDING} changes are already waiting for the phone; wait for the user to "
@@ -760,18 +897,23 @@ class PhoneStore:
     # Status and wipe ---------------------------------------------------------------
 
     def status(self, device_id: Any = None) -> dict[str, Any]:
-        """Counts and dates only, never content."""
+        """Counts and dates only, never content. A device asking about itself
+        is in use: that is noted, so its changes go to it (``_pick_device``)."""
+        now = int(self.clock())
+        stamp = None
         with self._read() as db:
             if db is None:
                 return {"stored": False, "generation": None, "device": None}
             answer: dict[str, Any] = {"stored": True, "generation": _meta(db, "generation"), "device": None}
             if isinstance(device_id, str) and _DEVICE_ID.match(device_id):
-                row = db.execute("SELECT kid, last_seen, sharing FROM devices WHERE id=?", (device_id,)).fetchone()
+                row = db.execute(f"SELECT kid, last_seen, sharing, {_IN_TOUCH} FROM devices WHERE id=?",
+                                 (device_id,)).fetchone()
                 if row is not None:
+                    stamp = row[3]
                     count = lambda table: db.execute(  # noqa: E731
                         f"SELECT COUNT(*) FROM {table} WHERE device=?", (device_id,)).fetchone()[0]
                     pending = db.execute("SELECT COUNT(*) FROM changes WHERE device=? AND state='pending'"
-                                         " AND expires_at>?", (device_id, int(self.clock()))).fetchone()[0]
+                                         " AND expires_at>?", (device_id, now)).fetchone()[0]
                     alarms = _decode(db.execute("SELECT alarms FROM devices WHERE id=?", (device_id,)).fetchone()[0], [])
                     answer["device"] = {
                         "kid": row[0], "last_sync": iso_utc(row[1]) if row[1] else None,
@@ -781,7 +923,33 @@ class PhoneStore:
                                    "alarms": len(alarms) if isinstance(alarms, list) else 0},
                         "pending": pending,
                     }
-            return answer
+        # A known device only, and at most one write a second per device
+        # (Conduit asks on every sync pass); a stamp from this second already
+        # puts it first.
+        if stamp is not None and stamp < now:
+            self._touch(device_id, answer["device"]["kid"], now)
+        return answer
+
+    def _touch(self, device_id: str, kid: str, now: int) -> None:
+        """Notes that a known device checked in. Never creates the store (a
+        wipe may have just removed it); a device gone or registered again
+        since the read (a new kid every time) is left alone."""
+        try:
+            connection = sqlite3.connect(f"{self.path.as_uri()}?mode=rw", uri=True, timeout=15,
+                                         isolation_level=None)
+        except sqlite3.DatabaseError as error:
+            logger.warning("conduit phone: couldn't note a check-in (%s); changes follow the last upload", error)
+            return
+        try:
+            # Only forward: a slower, older check-in never pulls it back.
+            connection.execute("UPDATE devices SET last_contact=? WHERE id=? AND kid=?"
+                               " AND COALESCE(last_contact, 0)<?", (now, device_id, kid, now))
+        except sqlite3.DatabaseError as error:
+            # The read just upgraded the schema, so this is a busy or broken
+            # file: routing falls back to the last upload, and says so.
+            logger.warning("conduit phone: couldn't note a check-in (%s); changes follow the last upload", error)
+        finally:
+            connection.close()
 
     def wipe(self, device_id: Any = None) -> dict[str, Any]:
         """Deletes one device's data, key and changes (pending ones are
@@ -800,16 +968,20 @@ class PhoneStore:
                 db.execute("DELETE FROM devices WHERE id=?", (device_id,))
         # Counted again under the writers' lock, so a key registered since
         # the delete stays.
-        with _thread_lock:
+        with self._locked():
             remaining = self._device_count()
             if remaining == 0:
-                for suffix in ("", "-wal", "-shm", "-journal"):
-                    with contextlib.suppress(FileNotFoundError):
+                # Companions first: a crash part-way never leaves a WAL that a
+                # fresh database could pick up.
+                for suffix in ("-wal", "-shm", "-journal", ""):
+                    # Windows refuses while a reader has it open; the data
+                    # is already deleted, and the next wipe tries again.
+                    with contextlib.suppress(OSError):
                         os.unlink(f"{self.path}{suffix}")
         return {"deleted": True, "remaining_devices": remaining}
 
     def _device_count(self) -> int:
-        """Devices in the store; the caller holds ``_thread_lock``."""
+        """Devices in the store; the caller holds ``_locked()``."""
         if not self.path.exists():
             return 0
         connection = sqlite3.connect(self.path, timeout=15)
@@ -831,7 +1003,7 @@ class PhoneStore:
             found = []
             for device_id, name, last_seen, sharing, tz, window_from, window_to, status_at, focus_at in db.execute(
                     "SELECT id, name, last_seen, sharing, tz, window_from, window_to, status_at, focus_at"
-                    " FROM devices WHERE last_seen IS NOT NULL ORDER BY last_seen DESC"):
+                    f" FROM devices WHERE last_seen IS NOT NULL ORDER BY {_IN_TOUCH_ORDER}"):
                 found.append({
                     "id": device_id, "name": name, "last_seen": last_seen, "sharing": _decode(sharing, {}),
                     "time_zone": tz, "window_from": window_from, "window_to": window_to,
@@ -844,20 +1016,24 @@ class PhoneStore:
 
     @contextlib.contextmanager
     def reader(self, need: str, device: Any = None,
-               exact: bool = False) -> Iterator[tuple[sqlite3.Connection, dict[str, Any]] | None]:
+               exact: bool = False, for_change: bool = False
+               ) -> Iterator[tuple[sqlite3.Connection, dict[str, Any]] | None]:
         """A read connection and the device to read: the one named, else the
         one that synced last sharing ``need`` (see ``shares``: "events",
         "reminders", "status", "focus", "calendars", "phone", "phone_tool",
         "alarms", "contacts" or "any"). None when nothing is shared.
         Raises PhoneError ``not_shared`` when the named device doesn't share
         it. ``exact``: ``device`` is an id and only that device is read (a
-        voice read), never another device by name."""
+        voice read), never another device by name. ``for_change``: the device
+        is the one a change will go to, so a device still setting up after a
+        new key isn't replaced by another (PhoneError ``device_not_ready``)."""
         with self._read() as db:
             if db is None:
                 yield None
                 return
             try:
-                device_id, name, sharing = _pick_device(db, device, need, exact=exact)
+                device_id, name, sharing = _pick_device(db, device, need, exact=exact,
+                                                        now=int(self.clock()) if for_change else None)
             except PhoneError as error:
                 if error.code == "nothing_shared" and not exact:
                     yield None
@@ -1119,6 +1295,16 @@ def _migrate(db: sqlite3.Connection, now: float) -> None:
         db.execute("ALTER TABLE devices ADD COLUMN alarms TEXT")
         db.execute("ALTER TABLE devices ADD COLUMN alarms_at INTEGER")
         db.execute(_CONTACTS_TABLE)
+        version = "2"
+    if version == "2":
+        # 0.51.9: when each device last checked in, so a change goes to the
+        # device in use rather than the last one that uploaded, and what a
+        # device set up again shared before its new key.
+        columns = {row[1] for row in db.execute("PRAGMA table_info(devices)")}
+        if "last_contact" not in columns:
+            db.execute("ALTER TABLE devices ADD COLUMN last_contact INTEGER")
+        if "prior_sharing" not in columns:
+            db.execute("ALTER TABLE devices ADD COLUMN prior_sharing TEXT")
         db.execute("UPDATE meta SET value=? WHERE key='schema'", (str(SCHEMA_VERSION),))
         return
     if version is not None:
@@ -1131,7 +1317,7 @@ def _migrate(db: sqlite3.Connection, now: float) -> None:
             device_public BLOB NOT NULL, host_private BLOB NOT NULL, host_public BLOB NOT NULL, kid TEXT NOT NULL,
             created_at INTEGER NOT NULL, last_seen INTEGER, last_sent INTEGER, tz TEXT, sharing TEXT,
             window_from TEXT, window_to TEXT, status TEXT, status_at INTEGER, focus TEXT, focus_at INTEGER,
-            alarms TEXT, alarms_at INTEGER);
+            alarms TEXT, alarms_at INTEGER, last_contact INTEGER, prior_sharing TEXT);
         CREATE TABLE IF NOT EXISTS calendars(
             device TEXT NOT NULL, id TEXT NOT NULL, title TEXT, kind TEXT NOT NULL, color TEXT, source TEXT,
             writable INTEGER NOT NULL, shared INTEGER NOT NULL, is_default INTEGER NOT NULL, position INTEGER NOT NULL,
@@ -1170,8 +1356,8 @@ _CONTACTS_TABLE = """
         PRIMARY KEY(device, id))"""
 
 
-def _drop_device_data(db: sqlite3.Connection, device_id: str) -> None:
-    for table in ("events", "reminders", "calendars", "changes", "contacts"):
+def _drop_device_data(db: sqlite3.Connection, device_id: str, keep_changes: bool = False) -> None:
+    for table in ("events", "reminders", "calendars", "contacts") + (() if keep_changes else ("changes",)):
         db.execute(f"DELETE FROM {table} WHERE device=?", (device_id,))
     db.execute("UPDATE devices SET status=NULL, status_at=NULL, focus=NULL, focus_at=NULL, alarms=NULL,"
                " alarms_at=NULL WHERE id=?", (device_id,))
@@ -1212,9 +1398,13 @@ _NEED_WORDS = {"events": "their calendar", "events_write": "adding to their cale
 
 
 def _pick_device(db: sqlite3.Connection, wanted: Any, need: str,
-                 exact: bool = False) -> tuple[str, str, dict[str, Any]]:
+                 exact: bool = False, now: int | None = None) -> tuple[str, str, dict[str, Any]]:
+    """The device a read or a change is for. Unnamed, it's the device in use:
+    the one that checked in (``status``) or uploaded most recently. ``now``
+    (for a change) also refuses to stand another device in for one that is
+    still setting up after a new key."""
     rows = [(row[0], row[1], _decode(row[2], {})) for row in db.execute(
-        "SELECT id, name, sharing FROM devices WHERE last_seen IS NOT NULL ORDER BY last_seen DESC")]
+        f"SELECT id, name, sharing FROM devices WHERE last_seen IS NOT NULL ORDER BY {_IN_TOUCH_ORDER}")]
     if exact:
         # Another device's name must never stand in for this one.
         named = [row for row in rows if row[0] == wanted]
@@ -1234,6 +1424,22 @@ def _pick_device(db: sqlite3.Connection, wanted: Any, need: str,
         if not shares(named[0][2], need):
             raise PhoneError("not_shared", f"{named[0][1]} doesn't share {_NEED_WORDS.get(need, need)} with Hermes")
         return named[0]
+    if now is not None:
+        # Bounded by the new key's age, not by check-ins: a device that keeps
+        # checking in but never uploads must not block changes for good. A
+        # device set up again holds its place only for what it shared before
+        # (a new one's sharing isn't known yet, so it holds it for anything).
+        # The first device in touch that could take the change decides.
+        for name, last_seen, created_at, sharing, prior_sharing, last_contact in db.execute(
+                "SELECT name, last_seen, created_at, sharing, prior_sharing, last_contact FROM devices"
+                f" ORDER BY {_IN_TOUCH_ORDER}"):
+            if last_seen is not None:
+                if shares(_decode(sharing, {}), need):
+                    break
+            elif (last_contact is not None and now - created_at < SETTING_UP_S
+                  and (prior_sharing is None or shares(_decode(prior_sharing, {}), need))):
+                raise PhoneError("device_not_ready", f"{name} is still setting up sharing with Hermes; ask again "
+                                 "in a minute, or name another device", status=409)
     for row in rows:
         if shares(row[2], need):
             return row
@@ -1271,9 +1477,68 @@ def _parse_sharing(value: Any) -> dict[str, Any]:
     return sharing
 
 
+def _forget_unshared(db: sqlite3.Connection, device_id: str, sharing: dict[str, Any]) -> None:
+    """Sharing turned off: forget what was kept."""
+    if sharing["calendar"] != "full":
+        db.execute("DELETE FROM events WHERE device=?", (device_id,))
+    if sharing["calendar"] == "off":
+        db.execute("DELETE FROM calendars WHERE device=? AND kind='event'", (device_id,))
+    elif sharing["calendar"] == "write_only":
+        db.execute("DELETE FROM calendars WHERE device=? AND kind='event' AND writable=0", (device_id,))
+    if not sharing["reminders"]:
+        db.execute("DELETE FROM reminders WHERE device=?", (device_id,))
+        db.execute("DELETE FROM calendars WHERE device=? AND kind='reminder'", (device_id,))
+    if not sharing["details"]:
+        for table in ("events", "reminders"):
+            db.execute(f"UPDATE {table} SET notes=NULL, url=NULL WHERE device=?", (device_id,))
+        db.execute("UPDATE events SET attendees=NULL WHERE device=?", (device_id,))
+    elif not sharing["attendee_emails"]:
+        for event_id, attendees in db.execute("SELECT id, attendees FROM events WHERE device=? AND attendees"
+                                              " LIKE '%\"email\"%'", (device_id,)).fetchall():
+            kept = [{key: value for key, value in person.items() if key != "email"}
+                    for person in _decode(attendees, [])]
+            db.execute("UPDATE events SET attendees=? WHERE device=? AND id=?",
+                       (json.dumps(kept) if kept else None, device_id, event_id))
+    if not sharing["status"]:
+        db.execute("UPDATE devices SET status=NULL, status_at=NULL WHERE id=?", (device_id,))
+    if not sharing["focus"]:
+        db.execute("UPDATE devices SET focus=NULL, focus_at=NULL WHERE id=?", (device_id,))
+    if not sharing["alarms"]:
+        db.execute("UPDATE devices SET alarms=NULL, alarms_at=NULL WHERE id=?", (device_id,))
+    if not sharing["contacts"]:
+        db.execute("DELETE FROM contacts WHERE device=?", (device_id,))
+
+
+def _narrowed(stored: Any, sharing: dict[str, Any]) -> dict[str, Any]:
+    """What stays shared when a batch can only take sharing away: each
+    switch as the narrower of the two. Nothing stored reads as nothing
+    shared."""
+    if not isinstance(stored, dict):
+        stored = {}
+    rank = {level: index for index, level in enumerate(reversed(CALENDAR_SHARING))}
+    narrowed = dict(sharing)
+    if rank.get(stored.get("calendar"), 0) < rank[sharing["calendar"]]:
+        narrowed["calendar"] = stored.get("calendar") if stored.get("calendar") in rank else "off"
+    for field, value in sharing.items():
+        if isinstance(value, bool):
+            narrowed[field] = value and stored.get(field) is True
+        elif field in ("past_days", "future_days"):
+            kept = stored.get(field)
+            narrowed[field] = min(value, kept) if isinstance(kept, int) and not isinstance(kept, bool) else 0
+    return narrowed
+
+
+def _not_ahead(at: datetime, field: str, now: int) -> datetime:
+    if at.timestamp() > now + MAX_CLOCK_SKEW_S:
+        raise PhoneError("clock_skew", f"{field} is more than {MAX_CLOCK_SKEW_S // 60} minutes ahead of this host;"
+                         " check the iPhone's clock and the host's")
+    return at
+
+
 def _apply(db: sqlite3.Connection, device_id: str, batch: dict[str, Any], now: int) -> dict[str, Any]:
-    sent_at = parse_time(batch.get("sent_at"), "sent_at",
-                         latest=datetime.fromtimestamp(now, timezone.utc) + timedelta(days=1))
+    # A batch from the future would shut out every real one after it (they'd
+    # all look older), revocations included: only clock skew is allowed.
+    sent_at = _not_ahead(parse_time(batch.get("sent_at"), "sent_at"), "sent_at", now)
     sharing = _parse_sharing(batch.get("sharing"))
     tz = batch.get("time_zone")
     if tz is not None and (not isinstance(tz, str) or not _TZ.match(tz)):
@@ -1334,47 +1599,31 @@ def _apply(db: sqlite3.Connection, device_id: str, batch: dict[str, Any], now: i
     parsed_alarms = _parse_alarms(alarms) if sharing["alarms"] and alarms is not None else None
     parsed_contacts = _parse_contacts(contacts) if sharing["contacts"] and contacts is not None else None
 
-    stored = db.execute("SELECT last_sent, status_at, focus_at FROM devices WHERE id=?", (device_id,)).fetchone()
-    sent_epoch = int(sent_at.timestamp())
-    stale = stored[0] is not None and sent_epoch < stored[0]
-
-    # Sharing turned off: forget what was kept, whatever the batch's age.
-    if sharing["calendar"] != "full":
-        db.execute("DELETE FROM events WHERE device=?", (device_id,))
-    if sharing["calendar"] == "off":
-        db.execute("DELETE FROM calendars WHERE device=? AND kind='event'", (device_id,))
-    elif sharing["calendar"] == "write_only":
-        db.execute("DELETE FROM calendars WHERE device=? AND kind='event' AND writable=0", (device_id,))
-    if not share_reminders:
-        db.execute("DELETE FROM reminders WHERE device=?", (device_id,))
-        db.execute("DELETE FROM calendars WHERE device=? AND kind='reminder'", (device_id,))
-    if not sharing["details"]:
-        for table in ("events", "reminders"):
-            db.execute(f"UPDATE {table} SET notes=NULL, url=NULL WHERE device=?", (device_id,))
-        db.execute("UPDATE events SET attendees=NULL WHERE device=?", (device_id,))
-    elif not sharing["attendee_emails"]:
-        for event_id, attendees in db.execute("SELECT id, attendees FROM events WHERE device=? AND attendees"
-                                              " LIKE '%\"email\"%'", (device_id,)).fetchall():
-            kept = [{key: value for key, value in person.items() if key != "email"}
-                    for person in _decode(attendees, [])]
-            db.execute("UPDATE events SET attendees=? WHERE device=? AND id=?",
-                       (json.dumps(kept) if kept else None, device_id, event_id))
-    if not sharing["status"]:
-        db.execute("UPDATE devices SET status=NULL, status_at=NULL WHERE id=?", (device_id,))
-    if not sharing["focus"]:
-        db.execute("UPDATE devices SET focus=NULL, focus_at=NULL WHERE id=?", (device_id,))
-    if not sharing["alarms"]:
-        db.execute("UPDATE devices SET alarms=NULL, alarms_at=NULL WHERE id=?", (device_id,))
-    if not sharing["contacts"]:
-        db.execute("DELETE FROM contacts WHERE device=?", (device_id,))
+    stored = db.execute("SELECT last_sent, status_at, focus_at, window_from, window_to FROM devices WHERE id=?",
+                        (device_id,)).fetchone()
+    sent_epoch = sent_at.timestamp()
+    # A watermark further ahead than skew allows came from before that
+    # limit; it doesn't get to hold newer batches off.
+    stale = stored[0] is not None and stored[0] <= now + MAX_CLOCK_SKEW_S and sent_epoch < stored[0]
+    if window is None and share_events and event_upserts and stored[3] and stored[4]:
+        # A diff without a range stays inside the one the user last shared.
+        try:
+            window = (datetime.fromisoformat(stored[3]), datetime.fromisoformat(stored[4]))
+        except (TypeError, ValueError):
+            window = None
+        if window is not None and (window[0].tzinfo is None or window[1].tzinfo is None or window[1] <= window[0]):
+            window = None
 
     counts = {"events": 0, "reminders": 0, "deleted": 0}
     if stale:
         # An older batch (a retry that arrived late) never undoes a newer
-        # one, and never widens what the newer one said is shared; it can
-        # only have narrowed it above, which the next batch restores.
+        # one: it neither widens nor narrows what the newer one said is
+        # shared. The phone resends only what changed, so nothing would put
+        # back what a stale batch took away.
         db.execute("UPDATE devices SET last_seen=? WHERE id=?", (now, device_id))
         return {**counts, "stale": True}
+
+    _forget_unshared(db, device_id, sharing)
 
     if parsed_calendars is not None:
         db.execute("DELETE FROM calendars WHERE device=?", (device_id,))
@@ -1421,6 +1670,15 @@ def _apply(db: sqlite3.Connection, device_id: str, batch: dict[str, Any], now: i
                         int(item["recurring"]), item["url"], item["notes"], now))
             counts["reminders"] += 1
 
+    if parsed_calendars is not None:
+        # A calendar or list taken out of the selection takes its items along.
+        for table, column, kind in (("events", "calendar_id", "event"), ("reminders", "list_id", "reminder")):
+            kept = [entry["id"] for entry in parsed_calendars if entry["kind"] == kind]
+            sql = f"DELETE FROM {table} WHERE device=? AND {column} IS NOT NULL"
+            if kept:
+                sql += f" AND {column} NOT IN ({','.join('?' * len(kept))})"
+            counts["deleted"] += db.execute(sql, (device_id, *kept)).rowcount
+
     # The alarms Conduit set and the people the user picked: replaced whole.
     if parsed_alarms is not None:
         db.execute("UPDATE devices SET alarms=?, alarms_at=? WHERE id=?",
@@ -1436,10 +1694,10 @@ def _apply(db: sqlite3.Connection, device_id: str, batch: dict[str, Any], now: i
         counts["contacts"] = len(parsed_contacts)
 
     # Latest only: an older reading never replaces a newer one.
-    if status is not None and (stored[1] is None or status["at"] >= stored[1]):
+    if status is not None and (stored[1] is None or stored[1] > now + MAX_CLOCK_SKEW_S or status["at"] >= stored[1]):
         db.execute("UPDATE devices SET status=?, status_at=? WHERE id=?",
                    (json.dumps(status["value"]), status["at"], device_id))
-    if focus is not None and (stored[2] is None or focus["at"] >= stored[2]):
+    if focus is not None and (stored[2] is None or stored[2] > now + MAX_CLOCK_SKEW_S or focus["at"] >= stored[2]):
         db.execute("UPDATE devices SET focus=?, focus_at=? WHERE id=?",
                    (json.dumps(focus["value"]), focus["at"], device_id))
     db.execute("UPDATE devices SET last_seen=?, last_sent=?, sharing=?, tz=COALESCE(?, tz) WHERE id=?",
@@ -1580,7 +1838,7 @@ def _parse_location_alarm(value: Any, field: str) -> dict[str, str] | None:
 
 def _parse_status(value: Any, now: int) -> dict[str, Any]:
     status = _object(value, "status") or {}
-    at = parse_time(status.get("at"), "status.at", latest=datetime.fromtimestamp(now, timezone.utc) + timedelta(days=1))
+    at = _not_ahead(parse_time(status.get("at"), "status.at"), "status.at", now)
     clean = {
         "battery": _number(status.get("battery"), "status.battery", 0, 1),
         "charging": _bool(status.get("charging"), "status.charging"),
@@ -1596,7 +1854,7 @@ def _parse_status(value: Any, now: int) -> dict[str, Any]:
 
 def _parse_focus(value: Any, now: int) -> dict[str, Any]:
     focus = _object(value, "focus") or {}
-    at = parse_time(focus.get("at"), "focus.at", latest=datetime.fromtimestamp(now, timezone.utc) + timedelta(days=1))
+    at = _not_ahead(parse_time(focus.get("at"), "focus.at"), "focus.at", now)
     active = _bool(focus.get("active"), "focus.active")
     if active is None:
         raise PhoneError("malformed", "focus.active must be true or false")
@@ -1770,7 +2028,7 @@ def _check_fields(kind: str, fields: dict[str, Any], *, partial: bool) -> dict[s
             raise PhoneError("malformed", f"notes must be text of at most {MAX_NOTES_CHARS} characters")
         clean["notes"] = clean_notes(notes, "notes")
     if "url" in present or not partial:
-        clean["url"] = _url(present.get("url"), "url")
+        clean["url"] = _write_url(present.get("url"), "url")
     if kind.endswith("_event"):
         all_day = _bool(present.get("all_day"), "all_day", None if partial else False)
         if all_day is not None:
@@ -1872,13 +2130,12 @@ def _check_change(db: sqlite3.Connection, device_id: str, kind: str, fields: dic
     collection = clean_fields.get("calendar_id" if is_event else "list_id")
     if collection is None and existing is not None:
         collection = existing.get("calendar_id" if is_event else "list_id")
-    if collection is not None:
-        calendar = _calendar_row(db, device_id, collection_kind, collection)
-        word = "calendar" if is_event else "list"
-        if calendar is None and (clean_fields.get("calendar_id" if is_event else "list_id") is not None):
-            raise PhoneError(f"unknown_{word}", f"No shared {word} has that id; see overview")
-        if calendar is not None and not calendar["writable"]:
-            raise PhoneError("read_only", f"The {word} {calendar['title'] or collection!r} is read-only on the phone")
+    calendar = _calendar_row(db, device_id, collection_kind, collection)
+    word = "calendar" if is_event else "list"
+    if collection is not None and calendar is None:
+        raise PhoneError(f"unknown_{word}", f"No shared {word} has that id; see overview")
+    if calendar is not None and not calendar["writable"]:
+        raise PhoneError("read_only", f"The {word} {calendar['title'] or collection!r} is read-only on the phone")
     merged = {**(existing or {}), **{key: value for key, value in clean_fields.items() if value is not None}}
     if kind in _DISPLAY_ONLY_KINDS and existing is not None:
         # The phone ignores these when applying; its card shows them, so the

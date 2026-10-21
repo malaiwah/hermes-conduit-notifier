@@ -350,7 +350,7 @@ def _distance_to(view: dict[str, Any], wanted: Any, now: float) -> dict[str, Any
     if fix is None:
         return {"ok": False, "error": "unknown", "note": "No location has arrived yet."}
     if fix["place_id"] == place["id"]:
-        return {"ok": True, "place": place["name"], "distance": "there now", "as_of": _ago(now - fix["at"])}
+        return {"ok": True, "place": place["name"], "distance": "there at the last fix", "as_of": _ago(now - fix["at"])}
     metres = (fix.get("distances_m") or {}).get(place["id"])
     if metres is None:
         return {"ok": False, "error": "no_distance",
@@ -373,7 +373,8 @@ def _history(store: LocationStore, view: dict[str, Any], args: dict[str, Any], n
     if start > end or (end - start).days >= MAX_HISTORY_DAYS:
         return {"ok": False, "error": "malformed", "note": f"from must not be after to, at most {MAX_HISTORY_DAYS} days."}
     begin = datetime(start.year, start.month, start.day, tzinfo=zone).timestamp()
-    finish = datetime(end.year, end.month, end.day, tzinfo=zone).timestamp() + 86400
+    after = end + timedelta(days=1)  # the next local midnight: not 24 hours on a clock-change day
+    finish = datetime(after.year, after.month, after.day, tzinfo=zone).timestamp()
     found, more = store.history(view["device_id"], begin, finish, MAX_HISTORY_ROWS)
     answer = {"ok": True, "from": start.isoformat(), "to": end.isoformat(), "history": found,
               "note": f"Arrivals at and departures from saved places, kept {retention} days. Private places and "
@@ -585,7 +586,8 @@ def _log(store: LocationStore, action: str, session: str) -> None:
         logger.warning("conduit_push: could not log a location read", exc_info=True)
 
 
-_VOICE_TITLES = {"gemini-live": "Gemini Live call", "grok-live": "Grok Live call", "gpt-live": "GPT-Live call"}
+_VOICE_TITLES = {"gemini-live": "Gemini Live call", "grok-live": "Grok Live call", "gpt-live": "GPT-Live call",
+                 "local-live": "Local Live call"}
 
 
 def _log_voice(store: LocationStore, action: str, provider: str) -> None:

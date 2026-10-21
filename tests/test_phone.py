@@ -289,6 +289,227 @@ def test_a_new_device_key_drops_the_device_data_and_the_same_key_keeps_it(store,
     assert store.ingest(fresh.seal(_batch("batch-0003")))["events"] == 5
 
 
+def test_a_new_device_key_marks_its_waiting_changes_lost_instead_of_dropping_them(store, iphone):
+    # A reinstall, a restore or sharing turned off and on gives the phone a
+    # new key, and the phone never sees what was waiting for the old one.
+    # The agent hears about it instead of telling the user to approve a card
+    # that will never come.
+    store.ingest(iphone.seal(_batch()))
+    change = store.add_change("add_reminder", {"title": "Rain boots in Léo's backpack"})
+    fresh = Phone(DEVICE)
+    fresh.accept(store.register_key(fresh.key_request()))
+    assert store.status(DEVICE)["device"]["pending"] == 0
+    store.ingest(fresh.seal(_batch("batch-0002")))
+    assert fresh.changes(store) == []
+    [lost] = store.unreported_outcomes()
+    assert lost["id"] == change["id"] and lost["state"] == "lost"
+    assert "set up again" in lost["note"]
+    assert store.changes()[0]["state"] == "lost"
+
+
+def test_a_change_the_phone_already_had_is_lost_with_a_check_first_note_and_its_late_outcome_lands(store, iphone):
+    # Sharing turned off and on: the same install fetched the change, gets a
+    # new key, then reports what it did with it.
+    store.ingest(iphone.seal(_batch()))
+    change = store.add_change("add_reminder", {"title": "Milk"})
+    assert [sent["id"] for sent in iphone.changes(store)] == [change["id"]]
+    again = Phone(DEVICE)
+    again.accept(store.register_key(again.key_request()))
+    [lost] = store.unreported_outcomes()
+    assert lost["state"] == "lost" and "before asking again" in lost["note"]
+    store.ingest(again.seal(_batch("batch-0002")))
+    again.changes(store, [{"id": change["id"], "outcome": "applied", "item_id": "r_milk2"}])
+    [applied] = store.unreported_outcomes()
+    assert applied["id"] == change["id"] and applied["state"] == "applied"
+
+
+def test_a_change_goes_to_the_device_last_in_touch(tmp_path):
+    # The phone checks in (status) on every pass, including when a message is
+    # sent; it uploads (last_seen) only when something changed. The device
+    # the user is holding is the one that checked in last.
+    clock = [NOW]
+    store = phone.PhoneStore(tmp_path, clock=lambda: clock[0])
+    handset = Phone()
+    handset.accept(store.register_key(handset.key_request()))
+    store.ingest(handset.seal(_batch()))
+    tablet = Phone("ipad-installation-2", name="iPad")
+    tablet.accept(store.register_key(tablet.key_request()))
+    clock[0] += 60
+    store.ingest(tablet.seal(_batch()))
+    clock[0] += 60
+    store.status(DEVICE)  # the iPhone checks in as the user sends a message
+    assert store.add_change("add_reminder", {"title": "Rain boots"})["device_name"] == "Eric's iPhone"
+    clock[0] += 60
+    store.status(tablet.device_id)
+    assert store.add_change("add_reminder", {"title": "Milk"})["device_name"] == "iPad"
+
+
+def test_a_device_still_setting_up_is_not_replaced_by_another(tmp_path):
+    # The iPad just got a new key and hasn't uploaded yet: its change must not
+    # land on the iPhone, which may be someone else's or in another room.
+    clock = [NOW]
+    store = phone.PhoneStore(tmp_path, clock=lambda: clock[0])
+    handset = Phone()
+    handset.accept(store.register_key(handset.key_request()))
+    store.ingest(handset.seal(_batch()))
+    clock[0] += 60
+    tablet = Phone("ipad-installation-2", name="iPad")
+    tablet.accept(store.register_key(tablet.key_request()))
+    store.status(tablet.device_id)
+    with pytest.raises(phone.PhoneError) as error:
+        store.add_change("add_reminder", {"title": "Milk"})
+    assert error.value.code == "device_not_ready" and "iPad" in str(error.value)
+    store.ingest(tablet.seal(_batch()))
+    assert store.add_change("add_reminder", {"title": "Milk"})["device_name"] == "iPad"
+    # Named explicitly, another device is still reachable.
+    assert store.add_change("add_reminder", {"title": "Bread"}, device=DEVICE)["device_name"] == "Eric's iPhone"
+
+
+def test_a_device_that_checks_in_but_never_uploads_stops_blocking_after_the_setting_up_window(tmp_path):
+    clock = [NOW]
+    store = phone.PhoneStore(tmp_path, clock=lambda: clock[0])
+    handset = Phone()
+    handset.accept(store.register_key(handset.key_request()))
+    store.ingest(handset.seal(_batch()))
+    tablet = Phone("ipad-installation-2", name="iPad")
+    tablet.accept(store.register_key(tablet.key_request()))
+    for _ in range(3):
+        clock[0] += phone.SETTING_UP_S // 2
+        store.status(tablet.device_id)
+    assert store.add_change("add_reminder", {"title": "Milk"})["device_name"] == "Eric's iPhone"
+
+
+def test_a_device_set_up_again_holds_its_place_only_for_what_it_shared_before(tmp_path):
+    # The iPad shared only phone status before its new key: a reminder can't
+    # be its change, so the iPhone, which shares reminders, takes it. Asked
+    # for something the iPad did share, it still holds its place.
+    clock = [NOW]
+    store = phone.PhoneStore(tmp_path, clock=lambda: clock[0])
+    handset = Phone()
+    handset.accept(store.register_key(handset.key_request()))
+    store.ingest(handset.seal(_batch()))
+    tablet = Phone("ipad-installation-2", name="iPad")
+    tablet.accept(store.register_key(tablet.key_request()))
+    clock[0] += 60
+    store.ingest(tablet.seal(_batch(sharing=_sharing(calendar="off", reminders=False, alarms=True))))
+    clock[0] += 60
+    again = Phone("ipad-installation-2", name="iPad")
+    again.accept(store.register_key(again.key_request()))
+    store.status(again.device_id)
+    assert store.add_change("add_reminder", {"title": "Milk"})["device_name"] == "Eric's iPhone"
+    with pytest.raises(phone.PhoneError) as error:
+        store.add_change("set_timer", {"label": "Pasta", "seconds": 600})
+    assert error.value.code == "device_not_ready"
+
+
+def test_a_device_setting_up_doesnt_block_once_another_is_in_touch_since(tmp_path):
+    clock = [NOW]
+    store = phone.PhoneStore(tmp_path, clock=lambda: clock[0])
+    handset = Phone()
+    handset.accept(store.register_key(handset.key_request()))
+    store.ingest(handset.seal(_batch()))
+    clock[0] += 60
+    tablet = Phone("ipad-installation-2", name="iPad")
+    tablet.accept(store.register_key(tablet.key_request()))
+    store.status(tablet.device_id)
+    with pytest.raises(phone.PhoneError) as error:
+        store.add_change("add_reminder", {"title": "Milk"})
+    assert error.value.code == "device_not_ready"
+    clock[0] += 60
+    store.status(DEVICE)  # the user picked up the iPhone since
+    assert store.add_change("add_reminder", {"title": "Milk"})["device_name"] == "Eric's iPhone"
+
+
+def test_a_device_setting_up_that_could_take_the_change_blocks_behind_one_that_couldnt(tmp_path):
+    # The iPad shared reminders and the old iPhone only status; both were set
+    # up again, the old iPhone checked in last. The reminder is the iPad's.
+    clock = [NOW]
+    store = phone.PhoneStore(tmp_path, clock=lambda: clock[0])
+    handset = Phone()
+    handset.accept(store.register_key(handset.key_request()))
+    store.ingest(handset.seal(_batch()))
+    tablet = Phone("ipad-installation-2", name="iPad")
+    tablet.accept(store.register_key(tablet.key_request()))
+    store.ingest(tablet.seal(_batch()))
+    old = Phone("old-iphone-3", name="Old iPhone")
+    old.accept(store.register_key(old.key_request()))
+    store.ingest(old.seal(_batch(sharing=_sharing(calendar="off", reminders=False))))
+    clock[0] += 60
+    for device in (Phone("ipad-installation-2", name="iPad"), Phone("old-iphone-3", name="Old iPhone")):
+        device.accept(store.register_key(device.key_request()))
+        clock[0] += 1
+        store.status(device.device_id)
+    with pytest.raises(phone.PhoneError) as error:
+        store.add_change("add_reminder", {"title": "Milk"})
+    assert error.value.code == "device_not_ready" and "iPad" in str(error.value)
+
+
+def test_a_check_in_read_before_a_new_key_doesnt_mark_the_new_registration(store, iphone):
+    store.ingest(iphone.seal(_batch()))
+    stale_kid = store.status(DEVICE)["device"]["kid"]
+    again = Phone(DEVICE)
+    again.accept(store.register_key(again.key_request()))
+    store._touch(DEVICE, stale_kid, NOW + 60)
+    import sqlite3
+    db = sqlite3.connect(store.path)
+    assert db.execute("SELECT last_contact FROM devices WHERE id=?", (DEVICE,)).fetchone()[0] != NOW + 60
+    db.close()
+
+
+def test_a_slower_older_check_in_never_pulls_the_stamp_back(store, iphone):
+    import sqlite3
+    store.ingest(iphone.seal(_batch()))
+    kid = store.status(DEVICE)["device"]["kid"]
+    store._touch(DEVICE, kid, NOW + 120)
+    store._touch(DEVICE, kid, NOW + 110)
+    db = sqlite3.connect(store.path)
+    assert db.execute("SELECT last_contact FROM devices WHERE id=?", (DEVICE,)).fetchone()[0] == NOW + 120
+    db.close()
+
+
+def test_a_check_in_writes_at_most_once_a_second(store, iphone, monkeypatch):
+    import sqlite3
+    store.ingest(iphone.seal(_batch()))
+    db = sqlite3.connect(store.path)
+    db.execute("UPDATE devices SET last_seen=last_seen-60")
+    db.commit()
+    db.close()
+    opened = []
+    connect = sqlite3.connect
+    monkeypatch.setattr(phone.sqlite3, "connect", lambda *a, **k: opened.append(a[0]) or connect(*a, **k))
+    store.status(DEVICE)
+    store.status(DEVICE)
+    assert sum("mode=rw" in str(path) for path in opened) == 1
+
+
+def test_a_check_in_that_cant_be_written_is_logged(store, iphone, monkeypatch, caplog):
+    import sqlite3
+    store.ingest(iphone.seal(_batch()))
+    db = sqlite3.connect(store.path)
+    db.execute("UPDATE devices SET last_seen=last_seen-60")
+    db.commit()
+    db.close()
+    connect = sqlite3.connect
+
+    def busy(path, *args, **kwargs):
+        if "mode=rw" in str(path):
+            raise sqlite3.OperationalError("database is locked")
+        return connect(path, *args, **kwargs)
+
+    monkeypatch.setattr(phone.sqlite3, "connect", busy)
+    with caplog.at_level("WARNING"):
+        assert store.status(DEVICE)["stored"] is True
+    assert "couldn't note a check-in" in caplog.text and "database is locked" in caplog.text
+
+
+def test_status_never_recreates_a_wiped_store_or_writes_for_an_unknown_device(store, iphone):
+    store.ingest(iphone.seal(_batch()))
+    store.status("not-a-known-device")
+    assert store.wipe()["remaining_devices"] == 0 and not store.path.exists()
+    assert store.status(DEVICE) == {"stored": False, "generation": None, "device": None}
+    assert not store.path.exists()
+
+
 def test_at_most_four_devices(store):
     for index in range(phone.MAX_DEVICES):
         store.register_key(Phone(f"device-{index:04d}").key_request())
@@ -340,10 +561,10 @@ def test_details_off_drops_notes_attendees_and_links_even_when_sent(store, iphon
 
 def test_attendee_emails_off_keeps_names_only(store, iphone):
     store.ingest(iphone.seal(_batch()))
-    store.ingest(iphone.seal({"batch_id": "batch-0002", "sent_at": "2026-10-14T08:05:00+01:00",
+    store.ingest(iphone.seal({"batch_id": "batch-0002", "sent_at": "2026-10-14T08:03:00+01:00",
                               "sharing": _sharing(attendee_emails=False)}))
     assert _events(store)["e_dentist"]["attendees"] == [{"name": "Sam", "status": "accepted", "role": "required"}]
-    store.ingest(iphone.seal(_batch("batch-0003", sent_at="2026-10-14T08:06:00+01:00",
+    store.ingest(iphone.seal(_batch("batch-0003", sent_at="2026-10-14T08:04:00+01:00",
                                     sharing=_sharing(attendee_emails=False))))
     assert "sam@example.com" not in json.dumps(_events(store))
 
@@ -396,7 +617,7 @@ def test_status_keeps_only_the_newest_reading(store, iphone):
 def test_a_diff_upserts_and_deletes_and_a_full_sync_replaces(store, iphone):
     store.ingest(iphone.seal(_batch()))
     result = store.ingest(iphone.seal({
-        "batch_id": "batch-0002", "sent_at": "2026-10-14T08:05:00+01:00", "sharing": _sharing(),
+        "batch_id": "batch-0002", "sent_at": "2026-10-14T08:03:00+01:00", "sharing": _sharing(),
         "events": {"full": False, "upsert": [_event(title="Dentist (moved)", start="2026-10-17T15:00:00+01:00",
                                                     end="2026-10-17T16:00:00+01:00")],
                    "delete": ["e_lunch", "e_unknown"]},
@@ -407,7 +628,7 @@ def test_a_diff_upserts_and_deletes_and_a_full_sync_replaces(store, iphone):
     assert len(events) == 4
     # A full sync is the whole window: anything it doesn't name goes.
     store.ingest(iphone.seal({
-        "batch_id": "batch-0003", "sent_at": "2026-10-14T08:10:00+01:00", "sharing": _sharing(),
+        "batch_id": "batch-0003", "sent_at": "2026-10-14T08:05:00+01:00", "sharing": _sharing(),
         "events": {"full": True, "from": "2026-10-07T00:00:00+01:00", "to": "2026-12-13T00:00:00+00:00",
                    "upsert": [_event("e_new", title="New thing")]},
         "reminders": {"full": True, "upsert": []}}))
@@ -422,6 +643,81 @@ def test_only_the_window_is_kept(store, iphone):
         "events": {"full": False, "from": "2026-10-15T00:00:00+01:00", "to": "2026-12-14T00:00:00+00:00",
                    "upsert": []}}))
     assert list(_events(store)) == ["e_dentist"]
+
+
+def test_a_diff_without_a_range_stays_in_the_shared_window(store, iphone):
+    store.ingest(iphone.seal(_batch()))
+    store.ingest(iphone.seal({
+        "batch_id": "batch-0002", "sent_at": "2026-10-14T08:03:00+01:00", "sharing": _sharing(),
+        "events": {"full": False, "upsert": [
+            _event("e_far", title="Far off", start="2027-03-01T10:00:00+00:00", end="2027-03-01T11:00:00+00:00"),
+            _event("e_old", title="Long ago", start="2026-09-01T10:00:00+01:00", end="2026-09-01T11:00:00+01:00"),
+            _event("e_soon", title="Soon", start="2026-10-20T10:00:00+01:00", end="2026-10-20T11:00:00+01:00")]}}))
+    events = _events(store)
+    assert "e_soon" in events and "e_far" not in events and "e_old" not in events
+
+
+def test_unselecting_a_calendar_or_list_forgets_its_items(store, iphone):
+    store.ingest(iphone.seal(_batch()))
+    batch = _batch()
+    calendars = [entry for entry in batch["calendars"] if entry["id"] not in ("c_family", "l_groceries")]
+    result = store.ingest(iphone.seal({"batch_id": "batch-0002", "sent_at": "2026-10-14T08:03:00+01:00",
+                                       "sharing": _sharing(), "calendars": calendars}))
+    assert result["deleted"] == 2
+    assert "e_standup" not in _events(store)
+    with store.reader("reminders") as (db, device):
+        assert {row[0] for row in db.execute("SELECT id FROM reminders WHERE device=?", (device["id"],))} \
+            == {"r_tax", "r_done"}
+    # Every list unselected: no reminder is left.
+    calendars = [entry for entry in calendars if entry["kind"] == "event"]
+    store.ingest(iphone.seal({"batch_id": "batch-0003", "sent_at": "2026-10-14T08:04:00+01:00",
+                              "sharing": _sharing(), "calendars": calendars}))
+    assert store.status(DEVICE)["device"]["counts"]["reminders"] == 0
+
+
+def test_a_refused_batch_narrows_from_nothing_stored_to_nothing():
+    narrowed = phone._narrowed(None, phone._parse_sharing(_sharing()))
+    assert narrowed["calendar"] == "off" and narrowed["future_days"] == 0
+    assert not any(value for value in narrowed.values() if isinstance(value, bool))
+    assert phone._narrowed({"reminders": True}, phone._parse_sharing(_sharing()))["calendar"] == "off"
+
+
+def test_a_future_batch_is_refused_and_cant_hold_off_a_revocation(store, iphone):
+    store.ingest(iphone.seal(_batch()))
+    with pytest.raises(phone.PhoneError) as error:
+        store.ingest(iphone.seal(_batch("batch-0002", sent_at="2026-10-14T08:06:00+01:00")))
+    assert error.value.code == "clock_skew"
+    assert store.status(DEVICE)["device"]["counts"]["events"] == 5
+    batch = _batch("batch-0002", sent_at="2026-10-14T08:01:00+01:00")
+    batch["status"]["at"] = "2026-10-14T08:06:00+01:00"
+    with pytest.raises(phone.PhoneError) as error:
+        store.ingest(iphone.seal(batch))
+    assert error.value.code == "clock_skew"
+    # Refused, but what it turns off is forgotten all the same.
+    with pytest.raises(phone.PhoneError) as error:
+        store.ingest(iphone.seal(_batch("batch-0002", sent_at="2026-10-14T08:30:00+01:00",
+                                        sharing=_sharing(reminders=False))))
+    assert error.value.code == "clock_skew"
+    assert store.status(DEVICE)["device"]["counts"]["reminders"] == 0
+    assert store.status(DEVICE)["device"]["counts"]["events"] == 5
+    # It can't widen anything: only the narrower of the two is kept.
+    with store._write() as db:
+        kept = json.loads(db.execute("SELECT sharing FROM devices").fetchone()[0])
+    assert kept["reminders"] is False and kept["calendar"] == "full"
+    with pytest.raises(phone.PhoneError):
+        store.ingest(iphone.seal(_batch("batch-0003", sent_at="2026-10-14T08:30:00+01:00",
+                                        sharing=_sharing(reminders=True, calendar="write_only"))))
+    with store._write() as db:
+        kept = json.loads(db.execute("SELECT sharing FROM devices").fetchone()[0])
+    assert kept["reminders"] is False and kept["calendar"] == "write_only"
+    # A watermark stored before the limit (a day ahead) doesn't make the
+    # real batches after it look stale.
+    with store._write() as db:
+        db.execute("UPDATE devices SET last_sent=?", (NOW + 20 * 3600,))
+    result = store.ingest(iphone.seal(_batch("batch-0003", sent_at="2026-10-14T08:01:00+01:00",
+                                             sharing=_sharing(calendar="off"))))
+    assert not result.get("stale")
+    assert store.status(DEVICE)["device"]["counts"]["events"] == 0
 
 
 def test_event_search_folds_non_ascii(store, iphone):
@@ -442,6 +738,20 @@ def test_a_late_older_batch_never_undoes_a_newer_one(store, iphone):
     result = store.ingest(older)
     assert result["stale"] is True and result["events"] == 0
     assert list(_events(store)) == ["e_dentist"]
+
+
+@pytest.mark.parametrize("narrower", [{"details": False}, {"calendar": "off"}])
+def test_a_late_narrowing_batch_erases_nothing(store, iphone, narrower):
+    # The phone resends only what changed, so a stale batch that stripped
+    # what the newer one shares would leave it stripped until a full sync.
+    older = iphone.seal(_batch("batch-0001", sent_at="2026-10-14T07:00:00+01:00", sharing=_sharing(**narrower)))
+    store.ingest(iphone.seal(_batch("batch-0002", sent_at="2026-10-14T08:00:00+01:00")))
+    assert store.ingest(older)["stale"] is True
+    store.ingest(iphone.seal(_batch("batch-0003", sent_at="2026-10-14T08:05:00+01:00",
+                                    events={"full": False, "upsert": [], "delete": []},
+                                    reminders={"full": False, "upsert": [], "delete": []})))
+    dentist = _events(store)["e_dentist"]
+    assert dentist["notes"] == "Bring the form.\nRoom 4" and dentist["url"] == "https://example.com/booking"
 
 
 def test_titles_are_capped_and_control_characters_neutralized(store, iphone):
@@ -556,6 +866,28 @@ def test_a_change_reaches_the_phone_and_its_outcome_comes_back(store, iphone):
     # A retried result changes nothing.
     iphone.changes(store, [{"id": change["id"], "outcome": "dismissed"}], call_id="call-00000003")
     assert store.changes()[0]["state"] == "applied"
+
+
+# Conduit keeps a change's URL only when it's http or https and applies the
+# rest without it, so anything else is refused here rather than lost there.
+@pytest.mark.parametrize("url", ["javascript:alert(1)", "ftp://files.example.com/a", "example.com/booking",
+                                 "/booking", "mailto:a@example.com", "https://"])
+@pytest.mark.parametrize("kind, fields", [
+    ("add_event", {"title": "Dentist", "start": "2026-10-16T15:00:00+01:00", "end": "2026-10-16T16:00:00+01:00"}),
+    ("add_reminder", {"title": "Milk"}),
+])
+def test_a_write_url_the_phone_would_drop_is_refused(store, iphone, kind, fields, url):
+    store.ingest(iphone.seal(_batch()))
+    with pytest.raises(phone.PhoneError) as error:
+        store.add_change(kind, {**fields, "url": url})
+    assert error.value.code == "malformed"
+
+
+@pytest.mark.parametrize("url", ["https://example.com/booking", "HTTP://example.com"])
+def test_a_write_url_over_http_or_https_is_kept(store, iphone, url):
+    store.ingest(iphone.seal(_batch()))
+    store.add_change("add_reminder", {"title": "Milk", "url": url})
+    assert iphone.changes(store)[0]["fields"]["url"] == url
 
 
 def test_pending_marks_seen_only_the_outcomes_it_shows(store, iphone):
@@ -798,6 +1130,16 @@ def test_a_write_queues_a_change_and_nudges_the_phone(home):
                   "end": "2026-10-16T16:00:00+01:00", "calendar": "personal",
                   "reason": "You asked me to book the dentist"}, session_id="s-1")
     assert added["status"] == "waiting_for_approval" and "approve" in added["note"]
+    # A voice chat answers it out loud: Hermes doesn't send the user to tap.
+    assert "say yes or no" in added["note"] and "don't ask them to tap first" in added["note"]
+    assert "ask them to tap the card" in added["note"]
+    # Conduit takes a spoken answer only as the user's very next words.
+    assert "very next words" in added["note"]
+    assert "very next words after the reply" in tool.CALENDAR_SCHEMA["description"]
+    assert "very next words after the reply" in tool.PHONE_SCHEMA["description"]
+    assert "by saying yes or no" in tool.CALENDAR_SCHEMA["description"]
+    assert "completions always ask" in tool.CALENDAR_SCHEMA["description"]
+    assert "by saying yes or no" in tool.PHONE_SCHEMA["description"]
     [event] = home.sent
     assert event["type"] == "phone.changes" and event["mode"] == "alert"
     assert event["event_id"] == f"phone:{added['change_id']}" and event["profile"] == "work"
@@ -927,7 +1269,8 @@ def test_routes_round_trip(client):
     assert body["ok"] is True and body["v"] == 1
     assert [item["id"] for item in handset.open_answer(body)["changes"]] == [change["id"]]
     assert http.post(f"{BASE}/phone/exchange", json={**handset.exchange_request(), "op": "other"}).status_code == 400
-    assert http.post(f"{BASE}/phone/ingest", json={**handset.seal(batch), "kid": "f" * 32}).status_code == 409
+    response = http.post(f"{BASE}/phone/ingest", json={**handset.seal(batch), "kid": "f" * 32})
+    assert response.status_code == 409 and response.json()["code"] == "unknown_key"
     assert http.post(f"{BASE}/phone/wipe", json={}).status_code == 400
     assert http.post(f"{BASE}/phone/wipe", json={"all": True, "device_id": DEVICE}).status_code == 400
     assert http.post(f"{BASE}/phone/wipe", json={"device_id": DEVICE}).json()["remaining_devices"] == 0
@@ -1018,11 +1361,76 @@ def test_voice_reads_never_reach_another_device(client):
     assert [device["id"] for device in overview["devices"]] == [DEVICE]
 
 
+@pytest.mark.parametrize("name, args", [("conduit_calendar", {"action": "overview"}),
+                                        ("conduit_phone", {"action": "status"})])
+def test_a_new_key_during_the_read_seals_nothing_to_the_old_key(client, monkeypatch, name, args):
+    owner = _route_shared(client)
+    tool = api._plugin_package_module("phone_tool")
+    read = tool.voice_handle
+
+    def re_keyed_meanwhile(*args, **kwargs):
+        # The request opened with the owner's key; before its read, the same
+        # device id registers a new key and shares under it.
+        store = phone.PhoneStore(client.home)
+        replacement = Phone()
+        replacement.accept(store.register_key(replacement.key_request()))
+        store.ingest(replacement.seal(_batch(batch_id="batch-0002", sent_at=datetime.now(timezone.utc).isoformat())))
+        return read(*args, **kwargs)
+
+    monkeypatch.setattr(tool, "voice_handle", re_keyed_meanwhile)
+    response = client.http.post(f"{BASE}/voice-tools/call", json=_voice_request(owner, name, args))
+    assert response.status_code == 409 and response.json()["code"] == "unknown_key", response.text
+
+
+def _exchange_re_keyed_meanwhile(store, monkeypatch, replacement, then=lambda: None):
+    opened = store.open_exchange
+
+    def re_keyed(*args, **kwargs):
+        # Opened with the old kid; before it runs, the device registers again.
+        answer = opened(*args, **kwargs)
+        replacement.accept(store.register_key(replacement.key_request()))
+        then()
+        return answer
+
+    monkeypatch.setattr(store, "open_exchange", re_keyed)
+
+
+def test_an_exchange_that_outlives_its_key_hands_out_nothing(store, iphone, monkeypatch):
+    store.ingest(iphone.seal(_batch()))
+    envelope = iphone.exchange_request()
+    replacement = Phone()
+
+    def share_and_get_a_change():
+        store.ingest(replacement.seal(_batch("batch-0002")))
+        store.add_change("add_reminder", {"title": "Milk"})
+
+    _exchange_re_keyed_meanwhile(store, monkeypatch, replacement, share_and_get_a_change)
+    with pytest.raises(phone.PhoneError) as refused:
+        store.exchange(envelope)
+    assert refused.value.code == "unknown_key"
+    [kept] = store.changes(mark_reported=False)
+    assert kept["state"] == "waiting" and kept["seen_by_phone"] is False, "the new key's change isn't handed out"
+
+
+def test_an_exchange_that_outlives_its_kid_records_no_outcome(store, iphone, monkeypatch):
+    store.ingest(iphone.seal(_batch()))
+    change = store.add_change("add_reminder", {"title": "Milk"})
+    envelope = iphone.exchange_request([{"id": change["id"], "outcome": "applied", "item_id": "r_1"}])
+    # The same device key again keeps the change but gets a new kid.
+    _exchange_re_keyed_meanwhile(store, monkeypatch, Phone(private=iphone.private))
+    with pytest.raises(phone.PhoneError) as refused:
+        store.exchange(envelope)
+    assert refused.value.code == "unknown_key"
+    [kept] = store.changes(mark_reported=False)
+    assert kept["id"] == change["id"] and kept["state"] == "waiting"
+
+
 def test_a_voice_read_needs_the_voice_seal(client):
     handset = _route_shared(client)
     # Sealed for the changes exchange: it doesn't open as a voice read.
     response = client.http.post(f"{BASE}/voice-tools/call", json={**handset.exchange_request(), "op": "voice"})
     assert response.status_code == 409 and "set up" in response.json()["detail"]
+    assert response.json()["code"] == "bad_seal"
     # And a voice read doesn't run as an exchange.
     response = client.http.post(f"{BASE}/phone/exchange",
                                 json=_voice_request(handset, "conduit_calendar", {"action": "overview"}))
@@ -1106,9 +1514,8 @@ def _phone_batch(batch_id="batch-0001", sent_at="2026-10-14T08:00:00+01:00", **s
                   alarms=ALARMS, contacts=CONTACTS)
 
 
-def test_a_version_1_store_upgrades_on_its_first_read_and_keeps_its_data(store, iphone):
+def _make_version_1(store):
     import sqlite3
-    store.ingest(iphone.seal(_batch()))
     db = sqlite3.connect(store.path)
     db.execute("ALTER TABLE devices DROP COLUMN alarms")
     db.execute("ALTER TABLE devices DROP COLUMN alarms_at")
@@ -1116,10 +1523,58 @@ def test_a_version_1_store_upgrades_on_its_first_read_and_keeps_its_data(store, 
     db.execute("UPDATE meta SET value='1' WHERE key='schema'")
     db.commit()
     db.close()
+
+
+def test_a_version_1_store_upgrades_on_its_first_read_and_keeps_its_data(store, iphone):
+    store.ingest(iphone.seal(_batch()))
+    _make_version_1(store)
     assert [device["id"] for device in store.devices()] == [DEVICE]
     assert len(_events(store)) == 5
     store.ingest(iphone.seal(_phone_batch("batch-0002", sent_at="2026-10-14T08:01:00+01:00")))
     assert store.status(DEVICE)["device"]["counts"]["contacts"] == 2
+
+
+def test_a_version_1_store_that_cant_upgrade_yet_says_so_instead_of_reading_as_empty(store, iphone, monkeypatch):
+    import contextlib
+    import sqlite3
+    store.ingest(iphone.seal(_batch()))
+    _make_version_1(store)
+
+    @contextlib.contextmanager
+    def locked():
+        raise sqlite3.OperationalError("database is locked")
+        yield
+
+    monkeypatch.setattr(store, "_write", locked)
+    for read in (lambda: store.status(DEVICE), store.devices, lambda: _events(store)):
+        with pytest.raises(phone.PhoneError) as raised:
+            read()
+        assert raised.value.code == "upgrade_pending" and raised.value.status == 503
+    monkeypatch.undo()
+    assert [device["id"] for device in store.devices()] == [DEVICE]
+
+
+def test_a_read_opens_the_file_once(store, iphone, monkeypatch):
+    import sqlite3
+    store.ingest(iphone.seal(_batch()))
+    opened = []
+    connect = sqlite3.connect
+    monkeypatch.setattr(phone.sqlite3, "connect", lambda *a, **k: opened.append(a) or connect(*a, **k))
+    assert store.status(DEVICE)["stored"] is True
+    assert len(opened) == 1
+
+def test_a_version_2_store_gains_last_contact_and_keeps_its_data(store, iphone):
+    import sqlite3
+    store.ingest(iphone.seal(_batch()))
+    db = sqlite3.connect(store.path)
+    db.execute("ALTER TABLE devices DROP COLUMN last_contact")
+    db.execute("ALTER TABLE devices DROP COLUMN prior_sharing")
+    db.execute("UPDATE meta SET value='2' WHERE key='schema'")
+    db.commit()
+    db.close()
+    assert [device["id"] for device in store.devices()] == [DEVICE]
+    assert store.status(DEVICE)["device"]["counts"]["events"] == 5
+    assert store.add_change("add_reminder", {"title": "Milk"})["device_id"] == DEVICE
 
 
 def test_alarms_and_contacts_land_and_are_forgotten_when_turned_off(store, iphone):

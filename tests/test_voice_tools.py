@@ -137,8 +137,10 @@ def test_a_request_without_the_device_key_opens_nothing(client):
     phone = VoicePhone()
     _share(client, phone, _batch())
     envelope = phone.ask({"action": "overview"})
-    assert client.post(f"{BASE}/voice-tools/call", json={**envelope, "call_id": "call-other-1"}).status_code == 409
-    assert client.post(f"{BASE}/voice-tools/call", json={**envelope, "kid": "f" * 32}).status_code == 409
+    response = client.post(f"{BASE}/voice-tools/call", json={**envelope, "call_id": "call-other-1"})
+    assert response.status_code == 409 and response.json()["code"] == "bad_seal"
+    response = client.post(f"{BASE}/voice-tools/call", json={**envelope, "kid": "f" * 32})
+    assert response.status_code == 409 and response.json()["code"] == "unknown_key"
     stranger = VoicePhone()
     stranger.kid, stranger.request_key = phone.kid, secrets.token_bytes(32)
     assert client.post(f"{BASE}/voice-tools/call", json=stranger.ask({"action": "overview"})).status_code == 409
@@ -175,6 +177,29 @@ def test_a_new_key_for_the_same_device_id_reads_none_of_the_old_data(client):
     assert not status.get("categories"), "what the old key said it shared goes with its data"
     # The real phone gets 409 on its next sync, sets up a key and sends it all again.
     assert client.post(f"{BASE}/health/ingest", json=owner.seal(_batch("batch-0002"))).status_code == 409
+
+
+@pytest.mark.parametrize("args", [{"action": "daily", "metrics": ["steps"], "from": "2026-10-11",
+                                   "to": "2026-10-12"}, {"action": "overview"}])
+def test_a_new_key_during_the_read_seals_nothing_to_the_old_key(client, monkeypatch, args):
+    owner = VoicePhone()
+    _share(client, owner, _batch())
+    tool = api._plugin_package_module("health_tool")
+    read = tool.voice_handle
+
+    def re_keyed_meanwhile(*args, **kwargs):
+        # The request opened with the owner's key; before its read, the same
+        # device id registers a new key and uploads under it.
+        store = health.HealthStore(api._calls_home())
+        replacement = VoicePhone(device_id=DEVICE)
+        replacement.accept(store.register_key(replacement.key_request()))
+        store.ingest(replacement.seal(_batch("batch-0002", steps=(4242, 4343))))
+        return read(*args, **kwargs)
+
+    monkeypatch.setattr(tool, "voice_handle", re_keyed_meanwhile)
+    response = client.post(f"{BASE}/voice-tools/call", json=owner.ask(args))
+    assert response.status_code == 409 and response.json()["code"] == "unknown_key", response.text
+    assert "4242" not in response.text
 
 
 def test_the_same_device_key_again_keeps_the_data(client):

@@ -46,10 +46,19 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
+try:
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None  # type: ignore[assignment]
+try:
+    import msvcrt
+except ImportError:  # everything but Windows
+    msvcrt = None  # type: ignore[assignment]
+
 FILE_NAME = "conduit-location.sqlite3"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 # Versions _migrate brings up to SCHEMA_VERSION.
-OLDER_SCHEMAS = ("1",)
+OLDER_SCHEMAS = ("1", "2")
 
 SALT = b"conduit-location-v1"
 INFO_INGEST = b"conduit-location-v1 ingest device-to-host"
@@ -145,6 +154,34 @@ _HOURS = re.compile(r"^(\d{2}):(\d{2})-(\d{2}):(\d{2})\Z")
 _CONTROL = re.compile("[\x00-\x1f\x7f-\x9f\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]+")
 
 _thread_lock = threading.Lock()
+
+
+@contextlib.contextmanager
+def _exclusive(handle: Any) -> Iterator[None]:
+    # The same locking as calls_store: flock where there is one, a
+    # first-byte lock on Windows.
+    if fcntl is not None:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    elif msvcrt is not None:
+        handle.seek(0)
+        for attempt in range(6):  # about a minute
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                break
+            except OSError:
+                if attempt == 5:
+                    raise
+        try:
+            yield
+        finally:
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        yield
 
 
 class LocationError(ValueError):
@@ -362,9 +399,23 @@ class LocationStore:
         return self.path.exists()
 
     @contextlib.contextmanager
+    def _locked(self) -> Iterator[None]:
+        """The writers' lock: a lock file beside the database, which every
+        process (two dashboards, the agent) and thread takes through its own
+        handle, then this process's thread lock. The file lock comes first,
+        so waiting on another process never holds up other profiles' stores
+        here. The lock file outlives a wipe, so a writer waiting on it never
+        races the unlink."""
+        lock_path = self.path.with_name(f".{self.path.name}.lock")
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        flags = os.O_RDWR | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+        with os.fdopen(os.open(lock_path, flags, 0o600), "a+b") as handle, _exclusive(handle), _thread_lock:
+            yield
+
+    @contextlib.contextmanager
     def _write(self) -> Iterator[sqlite3.Connection]:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        with _thread_lock:
+        with self._locked():
             if not self.path.exists():
                 # Owner-only from the first byte; SQLite gives the -wal and
                 # -shm files the same mode.
@@ -425,7 +476,9 @@ class LocationStore:
     def register_key(self, body: Any) -> dict[str, Any]:
         """A device's X25519 public key in, this profile's for that device
         out. Replaces the device's earlier key (the phone re-keys after a
-        reinstall or when the user turns sharing off and on)."""
+        reinstall or when the user turns sharing off and on) and forgets
+        what the old key sent. Registering the same device key keeps its
+        latest fix and batch watermark."""
         if not isinstance(body, dict):
             raise LocationError("malformed", "Expected a JSON object")
         device_id = body.get("device_id")
@@ -443,7 +496,7 @@ class LocationStore:
         kid = key_id(device_public, host_public)
         now = int(self.clock())
         with self._write() as db:
-            known = db.execute("SELECT 1 FROM devices WHERE id=?", (device_id,)).fetchone()
+            known = db.execute("SELECT device_public FROM devices WHERE id=?", (device_id,)).fetchone()
             count = db.execute("SELECT COUNT(*) FROM devices").fetchone()[0]
             if not known and count >= MAX_DEVICES:
                 raise LocationError("too_many_devices",
@@ -454,14 +507,36 @@ class LocationStore:
                 " VALUES(?,?,?,?,?,?,?)"
                 " ON CONFLICT(id) DO UPDATE SET name=excluded.name, device_public=excluded.device_public,"
                 " host_private=excluded.host_private, host_public=excluded.host_public, kid=excluded.kid,"
-                " created_at=excluded.created_at",
+                " created_at=excluded.created_at,"
+                " last_sent=CASE WHEN devices.device_public=excluded.device_public THEN devices.last_sent END",
                 (device_id, name, device_public, host_private, host_public, kid, now),
             )
-            # A new key means a reinstall or sharing turned off and on: what
-            # this device said before is no longer where the user is.
-            db.execute("DELETE FROM fixes WHERE device=?", (device_id,))
+            # A new key means a reinstall, sharing turned off and on, or a
+            # new pairing: nothing the old key sent carries over to it. The
+            # phone sends its saved places again with the new key. Its
+            # sharing stays until then (its maps choice counts meanwhile), and
+            # maps rows keep counting against the budget, emptied and closed.
+            if known and bytes(known[0]) != device_public:
+                for table in ("fixes", "visits", "places"):
+                    db.execute(f"DELETE FROM {table} WHERE device=?", (device_id,))
+                db.execute("UPDATE maps SET cache='', request='', answer=NULL,"
+                           " answered_at=COALESCE(answered_at, ?) WHERE device=?", (now, device_id))
+                db.execute("UPDATE devices SET last_sent=NULL WHERE id=?", (device_id,))
             generation = _meta(db, "generation")
         return {"kid": kid, "host_public_key": b64u(host_public), "generation": generation}
+
+    def _still_keyed(self, device_id: str, kid: str) -> None:
+        """Refuses once the device has registered again since ``kid`` was
+        checked. A sealed answer's read runs in its own connection after the
+        request is opened, so a re-registration (and the new key's upload) can
+        land in between; checking again after the read means an answer is
+        sealed to ``kid`` only if no newer key's data could have been read.
+        Every registration mints a new host key, so a kid never comes back."""
+        with self._read() as db:
+            row = None if db is None else db.execute("SELECT kid FROM devices WHERE id=?", (device_id,)).fetchone()
+        if row is None or row[0] != kid:
+            raise LocationError("unknown_key", "This device's location key isn't on this profile; set it up again",
+                                status=409)
 
     def _device_key(self, db: sqlite3.Connection, device_id: str, kid: str, purpose: bytes = INFO_INGEST) -> bytes:
         row = db.execute("SELECT device_public, host_private, host_public, kid FROM devices WHERE id=?",
@@ -510,6 +585,7 @@ class LocationStore:
             raise LocationError("malformed", "The sealed request doesn't match its envelope")
 
         def seal_answer(answer: Any) -> dict[str, str]:
+            self._still_keyed(device_id, kid)
             body = json.dumps({"call_id": call_id, "result": answer}, ensure_ascii=False).encode("utf-8")
             nonce, ct = seal(answer_key, body, voice_aad("answer", tool, kid, device_id, call_id))
             return {"nonce": nonce, "ct": ct}
@@ -611,16 +687,20 @@ class LocationStore:
                 jobs = [row[0] for row in db.execute("SELECT job_id FROM rules WHERE job_id IS NOT NULL")]
                 for table in ("rules", "reads", "locates"):
                     db.execute(f"DELETE FROM {table}")
-        with _thread_lock:
+        with self._locked():
             remaining = self._count("devices")
             if remaining == 0 and self._count("rules") == 0:
-                for suffix in ("", "-wal", "-shm", "-journal"):
-                    with contextlib.suppress(FileNotFoundError):
+                # Companions first: a crash part-way never leaves a WAL that a
+                # fresh database could pick up.
+                for suffix in ("-wal", "-shm", "-journal", ""):
+                    # Windows refuses while a reader has it open; the data
+                    # is already deleted, and the next wipe tries again.
+                    with contextlib.suppress(OSError):
                         os.unlink(f"{self.path}{suffix}")
         return {"deleted": True, "remaining_devices": remaining, "rule_jobs": jobs}
 
     def _count(self, table: str) -> int:
-        """Rows in a table; the caller holds ``_thread_lock``."""
+        """Rows in a table; the caller holds ``_locked()``."""
         if not self.path.exists():
             return 0
         connection = sqlite3.connect(self.path, timeout=15)
@@ -979,8 +1059,11 @@ def _migrate(db: sqlite3.Connection, now: float) -> None:
     version = _meta(db, "schema")
     if version == str(SCHEMA_VERSION):
         return
-    if version == "1":
-        db.execute(_MAPS_TABLE)
+    if version in OLDER_SCHEMAS:
+        if version == "1":
+            db.execute(_MAPS_TABLE)
+        # 3: when the newest batch was sent, so a late older one changes nothing.
+        db.execute("ALTER TABLE devices ADD COLUMN last_sent REAL")
         db.execute("UPDATE meta SET value=? WHERE key='schema'", (str(SCHEMA_VERSION),))
         return
     if version is not None:
@@ -992,7 +1075,7 @@ def _migrate(db: sqlite3.Connection, now: float) -> None:
         CREATE TABLE IF NOT EXISTS devices(
             id TEXT PRIMARY KEY, name TEXT NOT NULL,
             device_public BLOB NOT NULL, host_private BLOB NOT NULL, host_public BLOB NOT NULL, kid TEXT NOT NULL,
-            created_at INTEGER NOT NULL, last_seen REAL, sharing TEXT);
+            created_at INTEGER NOT NULL, last_seen REAL, sharing TEXT, last_sent REAL);
         CREATE TABLE IF NOT EXISTS places(
             device TEXT NOT NULL, id TEXT NOT NULL, position INTEGER NOT NULL, name TEXT NOT NULL,
             kind TEXT NOT NULL, private INTEGER NOT NULL, PRIMARY KEY(device, id));
@@ -1208,8 +1291,22 @@ def _area_text(area: dict[str, str] | None) -> str | None:
     return ", ".join(seen) or None
 
 
+def _forget_newly_private(db: sqlite3.Connection, device_id: str, places_list: list[dict[str, Any]]) -> None:
+    """A place the user just made private: what was kept while it wasn't (a
+    fix there with its coordinates, arrivals and departures naming it) goes,
+    as if it had been private all along."""
+    was_public = {place_id for place_id, private in db.execute(
+        "SELECT id, private FROM places WHERE device=?", (device_id,)) if not private}
+    for place in places_list:
+        if place["private"] and place["id"] in was_public:
+            db.execute("DELETE FROM visits WHERE device=? AND place_id=?", (device_id, place["id"]))
+            db.execute("UPDATE fixes SET precision='places', lat=NULL, lon=NULL, accuracy=NULL, area=NULL,"
+                       " distances=NULL, speed=NULL WHERE device=? AND place_id=?", (device_id, place["id"]))
+
+
 def _apply(db: sqlite3.Connection, device_id: str, batch: dict[str, Any], now: float) -> dict[str, Any]:
-    parse_time(batch.get("sent_at"), "sent_at")
+    # A phone clock running ahead mustn't make the batches after it look old.
+    sent = min(parse_time(batch.get("sent_at"), "sent_at").timestamp(), now)
     sharing = _parse_sharing(batch.get("sharing"))
     if batch.get("places") is not None:
         places_list = _parse_places(batch.get("places"))
@@ -1237,8 +1334,16 @@ def _apply(db: sqlite3.Connection, device_id: str, batch: dict[str, Any], now: f
     if locate_id is not None and (not isinstance(locate_id, str) or not _LOCATE_ID.match(locate_id)):
         raise LocationError("malformed", "locate_id is malformed")
 
-    db.execute("UPDATE devices SET last_seen=?, sharing=? WHERE id=?", (now, json.dumps(sharing), device_id))
+    last_sent = db.execute("SELECT last_sent FROM devices WHERE id=?", (device_id,)).fetchone()[0]
+    if last_sent is not None and sent < last_sent:
+        # An older batch (a retry that arrived late, or a replay) never
+        # undoes a newer one: not its sharing or pause, places, fix or moves.
+        db.execute("UPDATE devices SET last_seen=? WHERE id=?", (now, device_id))
+        return {"accepted": True, "stale": True, "fix": False, "events": 0, "rules_fired": []}
+    db.execute("UPDATE devices SET last_seen=?, last_sent=?, sharing=? WHERE id=?",
+               (now, sent, json.dumps(sharing), device_id))
     if places_list is not None:
+        _forget_newly_private(db, device_id, places_list)
         db.execute("DELETE FROM places WHERE device=?", (device_id,))
         for position, place in enumerate(places_list):
             db.execute("INSERT INTO places VALUES(?,?,?,?,?,?)",

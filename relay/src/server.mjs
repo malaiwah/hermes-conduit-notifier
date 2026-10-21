@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
-import { appendFileSync, chmodSync, readFileSync, realpathSync } from 'node:fs';
+import { appendFileSync, chmodSync, mkdirSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from 'node:fs';
+import { dirname } from 'node:path';
 import { isIP } from 'node:net';
 import { pathToFileURL } from 'node:url';
 import { ApnsClient } from './apns.mjs';
@@ -31,6 +32,7 @@ let apns;
 let limits;
 let apnsSend;
 let watchTools;
+let watchGrants;
 let rings;
 let liveActivities;
 let mapsTokens;
@@ -42,6 +44,15 @@ const MAPS_TOKENS_PER_HOUR = 12;
 // headroom for JSON escaping and delivery headers, dropping decision content
 // (not the notification) when a payload would exceed the bound.
 const MAX_NOTIFICATION_BYTES = 3800;
+// Hermes session keys (gateway `build_session_key`, custom API ids up to 256
+// characters) carry the platform's own ids: Matrix `!room:server` and
+// `@user:server`, WhatsApp `…@g.us`, a `main` profile's `agent:main~`. They
+// are opaque routing strings, kept whole: one with a control character or
+// over this many UTF-8 bytes is dropped, never cut (a cut key names another
+// chat, or none). Mirrors the plugin's events.SESSION_KEY_MAX_BYTES; twice
+// Hermes' 256-character cap, and small enough that a routing stub carrying
+// it twice stays under MAX_NOTIFICATION_BYTES.
+export const SESSION_KEY_MAX_BYTES = 512;
 
 // End-to-end encrypted events (#431): the plugin seals the content with a
 // key this relay never sees and sends an `e2e` envelope instead. The relay
@@ -55,6 +66,12 @@ const E2E_MAX_CT_CHARS = 2600;
 export const E2E_ANSWER_PREFIX = 'e2e1.';
 const E2E_MAX_ANSWER_CHARS = 11_000;
 const E2E_ANSWER_PATTERN = new RegExp(`^${E2E_ANSWER_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[0-9a-f]{32}\\.[A-Za-z0-9_-]{16}\\.[A-Za-z0-9_-]{22,10900}$`);
+// The sealed answer's header with a ciphertext of any length: an answer of
+// this shape the pattern above refuses is a broken or oversized sealed
+// answer, never plaintext.
+const E2E_ANSWER_SHAPE = new RegExp(`^${E2E_ANSWER_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[0-9a-f]{32}\\.[A-Za-z0-9_-]{16}\\.[A-Za-z0-9_-]+$`);
+// Plaintext clarify answers, in characters (UTF-16 units) after trimming.
+const MAX_ANSWER_CHARS = 2000;
 // Stands in for question text the relay can't read, so a parked batch keeps
 // its qids (the store sanitizer drops questions without text).
 const E2E_QUESTION_PLACEHOLDER = '[encrypted]';
@@ -92,7 +109,15 @@ const PHONE_BACKGROUND_TTL_S = 24 * 60 * 60;
 // A location request is only worth answering right away.
 const LOCATION_PUSH_TTL_S = 60;
 // Locate and maps lookups (conduit_maps) share it; the plugin keeps tighter budgets per kind.
-const LOCATION_PUSH_PER_HOUR = 60;
+// Test seam: the test suite can lower it to reach the limit quickly.
+const LOCATION_PUSH_PER_HOUR = process.env.RELAY_TEST_SEAMS === '1' && /^\d{1,3}$/.test(process.env.RELAY_TEST_LOCATION_PUSHES_PER_HOUR || '')
+  ? Number(process.env.RELAY_TEST_LOCATION_PUSHES_PER_HOUR)
+  : 60;
+// The answers the plugin retries: a send it can try again.
+const RETRYABLE_STATUS = (status) => status === 408 || status === 429 || status >= 500;
+// Event ids whose push is being sent -> a promise of whether it was kept
+// (delivered, or failed in a way a retry can't fix).
+const eventsInFlight = new Map();
 const LOCATION_TOKEN_GONE = new Set(['BadDeviceToken', 'Unregistered', 'DeviceTokenNotForTopic']);
 // Registration proof (token-proof.mjs): how long a pushed challenge stays
 // usable, and how often one device token may be challenged (each is a push).
@@ -107,6 +132,7 @@ const DEVICE_TOKEN_REFUSED = new Set(['BadDeviceToken', 'Unregistered', 'DeviceT
 
 function main() {
   config = readConfig();
+  assertDataDirectoryWritable(config.dataPath);
   store = new RelayStore(config.dataPath, config.storeLimits);
   // Accepting an event sweeps expired IDs; this frees them on a quiet relay.
   // Sweeps throttle themselves, so the timer runs just past that interval.
@@ -121,11 +147,11 @@ function main() {
   tokenChallenges = new TokenChallenges({ ttlMs: TOKEN_CHALLENGE_TTL_S * 1000 });
   // A reclaimed slot's installation leaves nothing behind in memory either.
   store.onReclaim = (id) => {
-    liveActivities?.removeInstallation(id);
+    releaseInstallation(id);
     console.warn(JSON.stringify({ level: 'warn', message: 'relay full: reclaimed the longest-inactive installation', installation_id: id }));
   };
   setInterval(() => tokenChallenges.sweep(), 60_000).unref();
-  const watchGrants = new WatchToolGrants({
+  watchGrants = new WatchToolGrants({
     maxGrants: config.watchLimits.maxGrants,
     maxPerGateway: config.watchLimits.maxGrantsPerGateway,
     ...config.watchWaits,
@@ -174,7 +200,23 @@ function main() {
     // it to one topic (the Watch's, say).
     const voipFailure = process.env.APNS_VOIP_FAILURE;
     const voipFailureTopic = process.env.APNS_VOIP_FAILURE_TOPIC;
+    // Test seam: the first N event pushes that aren't VoIP (not Live
+    // Activity updates or token challenges) fail before sends start
+    // succeeding, like an APNs blip: the first throws (a dropped
+    // connection), the second is refused, and so on alternately.
+    const failFirst = process.env.APNS_FAIL_FIRST || '0';
+    if (!/^\d{1,3}$/.test(failFirst)) throw new Error('APNS_FAIL_FIRST must be a whole number of sends.');
+    let failed = 0;
+    // Test seam: every send takes this long, so a copy can arrive mid-send.
+    const sendDelay = process.env.APNS_SEND_DELAY_MS || '0';
+    if (!/^\d{1,5}$/.test(sendDelay)) throw new Error('APNS_SEND_DELAY_MS must be a whole number of milliseconds.');
     apnsSend = async (deviceToken, notification) => {
+      if (Number(sendDelay)) await new Promise((resolve) => setTimeout(resolve, Number(sendDelay)));
+      if (failed < Number(failFirst) && notification.payload?.conduit && notification.pushType !== 'voip') {
+        failed += 1;
+        if (failed % 2) throw new Error('connection dropped');
+        return { ok: false, status: 503, reason: 'ServiceUnavailable' };
+      }
       if (voipFailure && notification.pushType === 'voip' && (!voipFailureTopic || notification.topic === voipFailureTopic)) {
         if (voipFailure === 'throw') throw new Error('voip connection dropped');
         return { ok: false, status: voipFailure === 'Unregistered' ? 410 : 400, reason: voipFailure };
@@ -397,8 +439,7 @@ async function route(request, response) {
     const installation = authorize(request, installationMatch[1], 'device');
     if (!installation) return sendJson(response, 401, { error: 'unauthorized' });
     enforceRevocationBudget();
-    store.deactivateInstallation(installation.id);
-    liveActivities.removeInstallation(installation.id);
+    deactivateInstallation(installation.id);
     response.writeHead(204).end();
     return;
   }
@@ -556,6 +597,16 @@ async function route(request, response) {
     // here. Outgoing routing carries the dashboard binding of the
     // AUTHENTICATED gateway credential (bound at pairing/claim time).
     const duplicateEvent = store.hasAcceptedEvent(installation.id, event.eventId, credential.gatewayId);
+    // A copy of an event whose push is still being sent (the plugin timed out
+    // waiting and retried) waits for that send: a duplicate answer now would
+    // end the plugin's retries even if the send then fails and gives its id
+    // back. A failed send is answered as one, so the plugin tries again.
+    const inFlightKey = `${installation.id}:${credential.gatewayId}:${event.eventId}`;
+    const inFlight = duplicateEvent ? eventsInFlight.get(inFlightKey) : undefined;
+    if (inFlight) {
+      if (await inFlight) return sendJson(response, 200, { accepted: true, duplicate: true });
+      return sendJson(response, 503, { error: 'delivery_failed' });
+    }
     // Keep capacity preflight through savePendingDecision synchronous with no
     // await: otherwise requests could interleave after this check and consume
     // the same last slot. A catch after acceptEvent would still consume the ID.
@@ -579,7 +630,7 @@ async function route(request, response) {
     enforceEventBudget();
     // The ceiling counts every new call request that gets this far, delivered
     // or not (paused, previews off, no device), and each retry of one that
-    // failed before it was taken: a host past it is misbehaving.
+    // failed: a host past it is misbehaving.
     if (!duplicateEvent && event.type === 'call.requested') enforceCallCeiling(installation.id);
     // Plugin version recording runs BEFORE the dedupe return: a second
     // gateway on the same installation running the same plugin version sends
@@ -591,6 +642,10 @@ async function route(request, response) {
         capabilities: event.pluginCapabilities,
       });
     }
+    // On the non-clarify path there must be no await from here until
+    // eventsInFlight.set below: a copy arriving in between would see the id
+    // taken with no send to wait for, and be told duplicate before the
+    // send's outcome is known.
     if (!store.acceptEvent(installation.id, event.eventId, credential.gatewayId)) return sendJson(response, 200, { accepted: true, duplicate: true });
     // Control event: version announcement only, never a notification.
     if (event.type === 'plugin.hello') return sendJson(response, 202, { accepted: true, delivered: false });
@@ -656,8 +711,10 @@ async function route(request, response) {
       if (!saved) return sendJson(response, 200, { accepted: true, duplicate: true });
       if (!notification) return sendJson(response, 202, { accepted: true, delivered: false });
       let result;
+      // The token this push went to: the device can register a new one meanwhile.
+      const sentToken = installation.deviceToken;
       try {
-        result = await apnsSend(installation.deviceToken, notification);
+        result = await apnsSend(sentToken, notification);
       } catch (error) {
         // A THROWN transport failure (dropped connection, DNS, TLS) is the
         // same outcome as a returned rejection: no device received the
@@ -667,7 +724,7 @@ async function route(request, response) {
         console.error(JSON.stringify({ level: 'error', message: 'apns send threw', error: error instanceof Error ? error.message : String(error) }));
         return sendJson(response, 502, { error: 'apns_unreachable' });
       }
-      if (result.status === 410 || result.reason === 'BadDeviceToken' || result.reason === 'Unregistered') { store.deactivateInstallation(installation.id); liveActivities.removeInstallation(installation.id); }
+      if (result.status === 410 || result.reason === 'BadDeviceToken' || result.reason === 'Unregistered') deactivateInstallationForToken(installation, sentToken);
       if (!result.ok) {
         // The answerable card never reached the device: flip the parked
         // decision to undeliverable so the plugin's next poll falls back to
@@ -677,34 +734,35 @@ async function route(request, response) {
       }
       return sendJson(response, 202, { accepted: true, delivered: true });
     }
-    // A fresh location for Hermes: a silent location push the phone's
-    // extension answers straight to its host. Never a visible notification,
-    // and never paused by notification preferences (the user controls it in
-    // Conduit's location settings).
-    if (event.type === 'location.requested') return sendLocationRequest(response, installation, event, gateway);
-    if (!shouldDeliver(installation.preferences, event.type)) return sendJson(response, 202, { accepted: true, delivered: false });
-    // A change Hermes may make without asking: wake Conduit silently, never
-    // a visible notification.
-    if (event.type === 'phone.changes' && event.mode === 'background') return sendPhoneBackground(response, installation, event, gateway);
-    // A phone that can ring gets the call as a VoIP push; anything that stops
-    // it ringing sends the usual notification below instead.
-    if (event.type === 'call.requested' && installation.voipToken && await ring(installation, event, gateway)) {
-      return sendJson(response, 202, { accepted: true, delivered: true, rang: true });
-    }
-    const notification = notificationFor(event, installation.preferences, gateway);
-    let result;
+    // The id was taken before the send so a second copy arriving meanwhile
+    // stays a duplicate. A push that then fails (APNs refused or unreachable,
+    // an hourly limit) gives the id back: the plugin retries with the same
+    // id, and that retry must send rather than be told it was a duplicate.
+    // A clarify decision keeps its id, because a retry can't re-park it and
+    // its undeliverable flag already sends the plugin to Hermes' own path.
+    // One edge stays open by design: a send APNs took whose answer was lost
+    // (a timeout) can show twice on the phone. Delivering twice beats never.
+    // Only a failure a retry can fix gives the id back: a request the relay
+    // calls malformed (400) would fail the same way, so it keeps deduping.
+    let settle;
+    eventsInFlight.set(inFlightKey, new Promise((resolve) => { settle = resolve; }));
+    let released = true;
+    let thrownStatus = null;
     try {
-      result = await apnsSend(installation.deviceToken, notification);
+      await deliverEvent(response, installation, event, gateway);
+      released = RETRYABLE_STATUS(response.statusCode);
     } catch (error) {
-      // Same contract as the decision path: a THROWN transport failure is
-      // reported upstream, never left to surface as a 500. There is no
-      // parked decision on this path, so there is nothing to flip.
-      console.error(JSON.stringify({ level: 'error', message: 'apns send threw', error: error instanceof Error ? error.message : String(error) }));
-      return sendJson(response, 502, { error: 'apns_unreachable' });
+      thrownStatus = Number(error?.status ?? 500);
+      throw error;
+    } finally {
+      // Waiting copies are settled first so nothing below can strand them;
+      // they resume only after this block, by which time the id is free.
+      eventsInFlight.delete(inFlightKey);
+      settle(!released);
+      if (released) store.releaseEvent(installation.id, event.eventId, credential.gatewayId);
+      if (released) console.warn(JSON.stringify({ level: 'warn', message: 'event push failed, id released for a retry', type: event.type, event_id: event.eventId, status: response.headersSent ? response.statusCode : thrownStatus, thrown: thrownStatus !== null }));
     }
-    if (result.status === 410 || result.reason === 'BadDeviceToken' || result.reason === 'Unregistered') { store.deactivateInstallation(installation.id); liveActivities.removeInstallation(installation.id); }
-    if (!result.ok) return sendJson(response, 502, { error: 'apns_rejected', reason: result.reason, status: result.status });
-    return sendJson(response, 202, { accepted: true, delivered: true });
+    return;
   }
 
   // ── Clarify answer loop ──────────────────────────────────────────────
@@ -725,14 +783,7 @@ async function route(request, response) {
     if (!installation) return sendJson(response, 401, { error: 'unauthorized' });
     enforceRateLimit(`decision-respond:${installation.id}`, 30, 60_000);
     const body = await readJson(request);
-    // An encrypted answer is opaque base64url: kept whole (never trimmed or
-    // truncated, which would break it) and only for the strict wire shape.
-    // Anything else, including plaintext that merely starts like one, is an
-    // ordinary answer (the plugin of an encrypted pairing rejects it).
-    const answer = typeof body.answer === 'string' && E2E_ANSWER_PATTERN.test(body.answer) && body.answer.length <= E2E_MAX_ANSWER_CHARS
-      ? body.answer
-      : cleanText(body.answer, 2000);
-    if (!answer) return sendJson(response, 400, { error: 'invalid_answer' });
+    const answer = validAnswer(body.answer);
     // question_id scopes the answer to ONE question of a batch decision
     // (first-answer-wins per qid, other qids stay open); its absence keeps
     // the legacy whole-decision shape for single-question cards.
@@ -831,6 +882,7 @@ async function route(request, response) {
     if (!credential || !store.authenticateGateway(credential.installationId, credential.gatewayId, credential.secret)) return sendJson(response, 401, { error: 'unauthorized' });
     enforceRevocationBudget();
     store.removeGateway(credential.installationId, credential.gatewayId);
+    watchGrants.closeOwned(credential.installationId, credential.gatewayId, 'revoked');
     response.writeHead(204).end();
     return;
   }
@@ -884,7 +936,30 @@ function proveDeviceToken(deviceToken, proof) {
 // The same phone's earlier installations for a token it just proved, with
 // their Live Activities.
 function retireOtherInstallations(deviceToken, exceptId) {
-  for (const id of store.retireOtherInstallationsWithDeviceToken(deviceToken, exceptId)) liveActivities.removeInstallation(id);
+  for (const id of store.retireOtherInstallationsWithDeviceToken(deviceToken, exceptId)) releaseInstallation(id);
+}
+
+// A deactivated installation's credentials stop authenticating, and what
+// they already hold open ends with them.
+function deactivateInstallation(id) {
+  store.deactivateInstallation(id);
+  releaseInstallation(id);
+}
+
+// A refused device token deactivates an installation only if it still owns
+// the token the refused push was sent to: one the phone registered while
+// the push was in flight stays, along with the activation and everything it
+// holds open.
+function deactivateInstallationForToken(installation, sentToken) {
+  if (!store.deactivateInstallationForToken(installation.id, sentToken)) return;
+  releaseInstallation(installation.id);
+}
+
+// Its Live Activities, and its Watch grants with their waiting calls, host
+// polls and audio bridges.
+function releaseInstallation(id) {
+  liveActivities?.removeInstallation(id);
+  watchGrants?.closeOwned(id, undefined, 'revoked');
 }
 
 // A PushKit or location token another active installation registered is
@@ -1091,6 +1166,43 @@ async function ring(installation, event, gateway) {
   return true;
 }
 
+// An accepted event that isn't a clarify decision, sent to the phone. Every
+// outcome is written to `response`, or thrown as a refusal (an hourly
+// limit). The caller keeps the event id for a 2xx or a 4xx a retry can't
+// fix, and gives it back for a throw, 408, 429 or 5xx.
+async function deliverEvent(response, installation, event, gateway) {
+  // A fresh location for Hermes: a silent location push the phone's
+  // extension answers straight to its host. Never a visible notification,
+  // and never paused by notification preferences (the user controls it in
+  // Conduit's location settings).
+  if (event.type === 'location.requested') return sendLocationRequest(response, installation, event, gateway);
+  if (!shouldDeliver(installation.preferences, event.type)) return sendJson(response, 202, { accepted: true, delivered: false });
+  // A change Hermes may make without asking: wake Conduit silently, never
+  // a visible notification.
+  if (event.type === 'phone.changes' && event.mode === 'background') return sendPhoneBackground(response, installation, event, gateway);
+  // A phone that can ring gets the call as a VoIP push; anything that stops
+  // it ringing sends the usual notification below instead.
+  if (event.type === 'call.requested' && installation.voipToken && await ring(installation, event, gateway)) {
+    return sendJson(response, 202, { accepted: true, delivered: true, rang: true });
+  }
+  const notification = notificationFor(event, installation.preferences, gateway);
+  let result;
+  // The token this push went to: the device can register a new one meanwhile.
+  const sentToken = installation.deviceToken;
+  try {
+    result = await apnsSend(sentToken, notification);
+  } catch (error) {
+    // Same contract as the decision path: a THROWN transport failure is
+    // reported upstream, never left to surface as a 500. There is no
+    // parked decision on this path, so there is nothing to flip.
+    console.error(JSON.stringify({ level: 'error', message: 'apns send threw', error: error instanceof Error ? error.message : String(error) }));
+    return sendJson(response, 502, { error: 'apns_unreachable' });
+  }
+  if (result.status === 410 || result.reason === 'BadDeviceToken' || result.reason === 'Unregistered') deactivateInstallationForToken(installation, sentToken);
+  if (!result.ok) return sendJson(response, 502, { error: 'apns_rejected', reason: result.reason, status: result.status });
+  return sendJson(response, 202, { accepted: true, delivered: true });
+}
+
 // True when APNs took a VoIP push for the phone's or the Watch's PushKit
 // token. A refused token is forgotten; any other failure leaves it for the
 // next call.
@@ -1199,13 +1311,15 @@ async function sendPhoneBackground(response, installation, event, gateway) {
   enforceRateLimit(`phone-background:${installation.id}`, PHONE_BACKGROUND_PER_HOUR, 60 * 60_000);
   const push = phoneBackgroundPushFor(event, gateway, { topic: config.topic });
   let result;
+  // The token this push went to: the device can register a new one meanwhile.
+  const sentToken = installation.deviceToken;
   try {
-    result = await apnsSend(installation.deviceToken, push);
+    result = await apnsSend(sentToken, push);
   } catch (error) {
     console.error(JSON.stringify({ level: 'error', message: 'apns background send threw', error: error instanceof Error ? error.message : String(error) }));
     return sendJson(response, 502, { error: 'apns_unreachable' });
   }
-  if (result.status === 410 || result.reason === 'BadDeviceToken' || result.reason === 'Unregistered') { store.deactivateInstallation(installation.id); liveActivities.removeInstallation(installation.id); }
+  if (result.status === 410 || result.reason === 'BadDeviceToken' || result.reason === 'Unregistered') deactivateInstallationForToken(installation, sentToken);
   if (!result.ok) return sendJson(response, 502, { error: 'apns_rejected', reason: result.reason, status: result.status });
   return sendJson(response, 202, { accepted: true, delivered: true, background: true });
 }
@@ -1308,7 +1422,7 @@ function validateEvent(body) {
     type: body.type,
     title: cleanText(body.title, 120),
     body: cleanText(body.body, 500),
-    sessionId: cleanIdentifier(body.session_id, 180),
+    sessionId: cleanSessionKey(body.session_id),
     profile: cleanText(body.profile, 80),
     gateway: cleanIdentifier(body.gateway, 80),
     pluginVersion: cleanIdentifier(body.plugin_version, 40),
@@ -1350,7 +1464,7 @@ function validateCall(value) {
   const sessionIds = [];
   for (const item of value.session_ids) {
     // Like the plugin (events.sanitize_call): one malformed id drops the call.
-    const sessionId = typeof item === 'string' && item.length <= 180 ? cleanIdentifier(item, 180) : undefined;
+    const sessionId = cleanSessionKey(item);
     if (!sessionId) return undefined;
     if (!sessionIds.includes(sessionId)) sessionIds.push(sessionId);
   }
@@ -1425,7 +1539,7 @@ function validateDecision(value, eventType) {
   if (!value || typeof value !== 'object') return undefined;
   const kind = cleanText(value.kind, 40);
   if (kind === 'approval' && eventType === 'approval.needed') {
-    const sessionKey = cleanIdentifier(value.session_key, 180);
+    const sessionKey = cleanSessionKey(value.session_key);
     const description = cleanText(value.description, 500);
     if (!sessionKey || !description) return undefined;
     const allowed = new Set(['once', 'session', 'always', 'deny']);
@@ -1492,12 +1606,42 @@ function validatedToken(value, error) {
   return token;
 }
 
+// A clarify answer, kept whole or refused, never cut: a cut sealed answer
+// no longer opens, and a cut plaintext one isn't what the user wrote.
+// - An encrypted answer is opaque base64url, kept whole (never trimmed) and
+//   only for the strict wire shape. One with the sealed header that is too
+//   long is `413 answer_too_large`; one whose ciphertext is too short to
+//   hold its tag is `400 invalid_answer`.
+// - Anything else, including plaintext that merely starts like one, is an
+//   ordinary answer (the plugin of an encrypted pairing rejects it): control
+//   characters become spaces and it is trimmed; over MAX_ANSWER_CHARS it is
+//   `413 answer_too_large`.
+function validAnswer(value) {
+  if (typeof value !== 'string') throw httpError(400, 'invalid_answer');
+  if (E2E_ANSWER_SHAPE.test(value)) {
+    if (E2E_ANSWER_PATTERN.test(value) && value.length <= E2E_MAX_ANSWER_CHARS) return value;
+    // Only the ciphertext's length can fail the pattern here.
+    const tooShort = value.length - value.lastIndexOf('.') - 1 < 22;
+    throw tooShort ? httpError(400, 'invalid_answer') : httpError(413, 'answer_too_large');
+  }
+  const answer = value.replace(/[\u0000-\u001f]/g, ' ').trim();
+  if (!answer) throw httpError(400, 'invalid_answer');
+  if (answer.length > MAX_ANSWER_CHARS) throw httpError(413, 'answer_too_large');
+  return answer;
+}
+
 function cleanText(value, max) {
   return typeof value === 'string' ? value.replace(/[\u0000-\u001f]/g, ' ').trim().slice(0, max) || undefined : undefined;
 }
 
 function cleanIdentifier(value, max) {
   return typeof value === 'string' && /^[A-Za-z0-9:_.\/-]+$/.test(value) ? value.slice(0, max) : undefined;
+}
+
+// A session key, whole, or undefined (see SESSION_KEY_MAX_BYTES).
+function cleanSessionKey(value) {
+  return typeof value === 'string' && value && value.isWellFormed() && !/[\u0000-\u001f\u007f]/.test(value)
+    && Buffer.byteLength(value) <= SESSION_KEY_MAX_BYTES ? value : undefined;
 }
 
 function readJson(request, maxChars = 32_768) {
@@ -1626,7 +1770,7 @@ function readConfig() {
   // The APNs test seams fake delivery (and the capture writes every payload
   // to disk), so a relay refuses to start with them unless the test suite
   // says it's a test.
-  const seams = ['APNS_MODE', 'APNS_CAPTURE_PATH', 'APNS_VOIP_FAILURE'].filter((name) => process.env[name]);
+  const seams = ['APNS_MODE', 'APNS_CAPTURE_PATH', 'APNS_VOIP_FAILURE', 'APNS_FAIL_FIRST', 'APNS_SEND_DELAY_MS'].filter((name) => process.env[name]);
   if (seams.length && process.env.RELAY_TEST_SEAMS !== '1') {
     throw new Error(`${seams.join(', ')} ${seams.length > 1 ? 'are test settings' : 'is a test setting'}; unset it for a real relay.`);
   }
@@ -1674,6 +1818,23 @@ function readConfig() {
     tokenProof: tokenProofModeFromEnv(process.env),
     ...limitsFromEnv(process.env),
   };
+}
+
+// Loading the store only reads, so a data directory the relay can't write
+// would pass /healthz and fail the first registration instead. A Compose bind
+// mount Docker created itself is root's, while the image runs as node.
+function assertDataDirectoryWritable(dataPath) {
+  const directory = dirname(dataPath);
+  const probe = `${dataPath}.${process.pid}.probe`;
+  try {
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    writeFileSync(probe, '', { flag: 'wx', mode: 0o600 });
+    unlinkSync(probe);
+  } catch (error) {
+    const uid = process.getuid?.();
+    throw new Error(`DATA_PATH directory ${directory} is not writable${uid === undefined ? '' : ` by uid ${uid}`} (${error?.code ?? error}). `
+      + 'With the Compose file, create it owned by the image\'s node user first: mkdir -p data && sudo chown 1000:1000 data');
+  }
 }
 
 function optionalMilliseconds(name, key) {

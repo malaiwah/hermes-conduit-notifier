@@ -36,15 +36,13 @@ from hermes_constants import get_hermes_home
 from . import client, location_tool, maps_host
 from .events import push_event
 from .location_store import TRUSTED_BACKGROUND_S, TRUSTED_TALKING_S, LocationError, LocationStore, sharing_paused
-from .present_store import PresentError, PresentStore
+from .present_store import NAVIGATE_FEATURE, PresentError, PresentStore
 
 logger = logging.getLogger("hermes.plugins.conduit_push")
 
 TOOL_NAME = "conduit_maps"
 TOOLSET = "conduit"
 ACTIONS = ("search", "lookup", "reverse_geocode", "directions", "travel_times", "navigate")
-# What a Conduit that opens Apple Maps for navigate says it can do.
-NAVIGATE_FEATURE = "maps-navigate"
 NAVIGATE_TTL_MINUTES = 15
 NAVIGATE_SPOKEN_YES = ("go", "let's go", "go ahead", "open maps")
 # Apple Maps link travel flags; cycling has none, so Maps picks.
@@ -189,7 +187,10 @@ def _handle(args: dict[str, Any], session_id: Any, is_child: Callable[[Any], boo
     phone = store.maps_device()
     host = maps_host.configured() and store.maps_host_allowed()
     if phone is None and not host:
-        return _unavailable(view, args, action)
+        answer = _unavailable(view, args, action)
+        if answer.get("rough_estimate"):
+            location_tool._log(store, f"maps {action}", session)
+        return answer
     try:
         request = _request(action, args, view or {"places": {}, "sharing": {}}, store.clock())
     except _Refused as refused:
