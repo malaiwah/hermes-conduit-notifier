@@ -840,7 +840,7 @@ def _deliver(event: dict[str, Any], *, sleep: Callable[[float], None] = _pause,
                         event.get("type", "event"), _pause_reason(state), paused_until - now)
             return False
         try:
-            _send(event, state, timeout=max(MIN_SEND_TIMEOUT, min(SEND_TIMEOUT, started + RETRY_BUDGET - now)))
+            answer = _send(event, state, timeout=max(MIN_SEND_TIMEOUT, min(SEND_TIMEOUT, started + RETRY_BUDGET - now)))
         except Exception as error:
             if delay is not None and _worth_retrying(error) and clock() - started + delay <= RETRY_BUDGET:
                 logger.info("Conduit notification delivery for %s will be retried: %s", event.get("type", "event"), error)
@@ -853,8 +853,29 @@ def _deliver(event: dict[str, Any], *, sleep: Callable[[float], None] = _pause,
             return False
         record_relay_accepted(state)
         _note_push(True)
+        _log_accepted(event, answer)
         return True
     return False  # not reached: the last attempt has no delay
+
+
+def _log_accepted(event: dict[str, Any], answer: Any) -> None:
+    """One line per event the relay took, with what it did with it, so a
+    notification that never reached the phone can be traced: the relay
+    pushed it, saw a duplicate, or chose not to push (preferences, no
+    token). Only the type, the local event id and the relay's flags; never
+    content."""
+    try:
+        kind, event_id = event.get("type", "event"), str(event.get("event_id") or "")
+        answer = answer if isinstance(answer, dict) else {}
+        if answer.get("duplicate"):
+            logger.info("Conduit relay accepted %s %s as a duplicate: no new push", kind, event_id)
+        elif answer.get("delivered") is False and kind != "plugin.hello":
+            reason = str(answer.get("reason") or "the relay's delivery preferences")[:80]
+            logger.warning("Conduit relay accepted %s %s but did not push it (%s)", kind, event_id, reason)
+        else:
+            logger.info("Conduit relay accepted %s %s (delivered=%s)", kind, event_id, answer.get("delivered"))
+    except Exception:  # noqa: BLE001
+        logger.debug("Conduit could not log an accepted push", exc_info=True)
 
 
 def _note_push(ok: bool, error: Exception | None = None) -> None:
