@@ -48,9 +48,10 @@ class _Relay:
     """A local relay that answers /v1/events with the given statuses in turn
     (200 once they run out) and records the event ids it was sent."""
 
-    def __init__(self, statuses):
+    def __init__(self, statuses, answer=None):
         self.statuses = list(statuses)
         self.event_ids = []
+        self.answer = answer or {"accepted": True}
         relay = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -62,7 +63,7 @@ class _Relay:
                     # Something in front of the relay: no JSON error body.
                     status, answer = 403, b""
                 else:
-                    answer = json.dumps({"accepted": True} if status < 300 else {"error": "nope"}).encode()
+                    answer = json.dumps(relay.answer if status < 300 else {"error": "nope"}).encode()
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(answer)))
@@ -92,8 +93,8 @@ def paired(tmp_path, monkeypatch):
     client._refusals.clear()
     relays = []
 
-    def pair(statuses, **extra):
-        relay = _Relay(statuses)
+    def pair(statuses, answer=None, **extra):
+        relay = _Relay(statuses, answer)
         relays.append(relay)
         state = {"credential": "inst.gw.secret", "installation_id": "inst", "gateway_id": "gw",
                  "gateway_name": "box", "relay_url": relay.url}
@@ -494,3 +495,25 @@ def test_notifications_paused_follows_this_profiles_pairing(paired):
     assert client.notifications_paused() is True
     client._refusals[CREDENTIAL]["until"] = 0.0
     assert client.notifications_paused() is False
+
+
+@pytest.mark.parametrize("answer, level, words", [
+    ({"accepted": True, "delivered": True}, "INFO", "(delivered=True)"),
+    ({"accepted": True, "duplicate": True}, "INFO", "as a duplicate: no new push"),
+    ({"accepted": True, "delivered": False}, "WARNING", "did not push it (the relay's delivery preferences)"),
+    ({"accepted": True, "delivered": False, "reason": "no_location_token"}, "WARNING",
+     "did not push it (no_location_token)"),
+])
+def test_each_accepted_event_is_logged_with_what_the_relay_did(paired, caplog, answer, level, words):
+    paired([], answer=answer)
+
+    with caplog.at_level("INFO", logger=client.logger.name):
+        _deliver(_event())
+
+    lines = [r for r in caplog.records if "Conduit relay accepted" in r.getMessage()]
+    assert len(lines) == 1
+    assert lines[0].levelname == level
+    assert "response.ready response:0123456789abcdef" in lines[0].getMessage()
+    assert words in lines[0].getMessage()
+    assert "Done." not in lines[0].getMessage()  # never the content
+
